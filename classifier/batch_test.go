@@ -1141,3 +1141,48 @@ func (g *countingGenerator) peak() int {
 	defer g.mu.Unlock()
 	return g.maxInFlight
 }
+
+// TestEvaluateBatchHonoursTheSoftmaxTemperature checks the batch path
+// normalises at the configured temperature too. It folds its items' waves
+// through the same function a single evaluation does, but from its own call
+// site, so a plumbing change that reached one could miss the other.
+//
+// The three options score 0.9, 0.6 and 0.2 — distinct, because equal scores
+// are uniform at every temperature and would report the same distribution
+// whether the temperature arrived or not.
+func TestEvaluateBatchHonoursTheSoftmaxTemperature(t *testing.T) {
+	const fitted = 5.04
+
+	run := func(opts ...Option) []float64 {
+		t.Helper()
+		resp, err := New(&scriptedScorer{t: t, script: temperatureScript}, opts...).
+			EvaluateBatch(context.Background(), BatchRequest{
+				Items:     []BatchItem{{ID: "a", State: StringState("s")}},
+				Questions: mustQuestions(t, temperatureQuestions),
+			})
+		if err != nil {
+			t.Fatalf("EvaluateBatch returned %v", err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].Error != "" {
+			t.Fatalf("batch result: %+v", resp.Results)
+		}
+		answer, ok := resp.Results[0].Answers.Get("pick")
+		if !ok {
+			t.Fatal("the item has no answer for the question")
+		}
+		if answer.Choice != "high" {
+			t.Fatalf("choice = %q, want %q at every temperature", answer.Choice, "high")
+		}
+		return probabilitiesOf(t, answer, "high", "middle", "low")
+	}
+
+	// The same literals the single-evaluation test pins, so the two paths are
+	// held to one set of numbers rather than to each other.
+	base, warm := run(), run(WithSoftmaxTemperature(fitted))
+	if want := []float64{0.837209, 0.139535, 0.023256}; !equalFloats(base, want) {
+		t.Fatalf("a batch at the default reported %v, want %v", base, want)
+	}
+	if want := []float64{0.456212, 0.319721, 0.224066}; !equalFloats(warm, want) {
+		t.Fatalf("a batch at temperature %v reported %v, want %v", fitted, warm, want)
+	}
+}

@@ -83,6 +83,12 @@ Content-Type: application/json
 # One call per option, scored independently, then normalised. You get the
 # winner AND the full distribution, so you can see how close the runner-up was.
 # 1 to 255 options. Declaration order breaks an exact tie.
+#
+# Probabilities and confidences come back to six decimal places, and never as
+# an exact 0 or 1: the per-candidate scores are clamped away from both ends,
+# so no option is ever certainly right or certainly wrong, and log(p) always
+# exists if you want to renormalise. PERCEPTEA_SOFTMAX_TEMPERATURE flattens
+# or sharpens the distribution — it cannot change which option wins.
 ###############################################################################
 
 ### choice — route a support ticket

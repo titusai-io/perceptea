@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -14,10 +15,18 @@ import (
 // flight when no other limit is configured.
 const DefaultMaxConcurrency = 8
 
+// DefaultSoftmaxTemperature is the softmax temperature an [Evaluator] uses
+// when none is configured. It is 1 — the identity — so that turning the knob
+// is the only thing that ever moves a deployment's numbers.
+//
+// This is not the sampling temperature. See [WithSoftmaxTemperature].
+const DefaultSoftmaxTemperature = 1.0
+
 // options holds the settings an [Option] can change.
 type options struct {
-	maxConcurrency int
-	now            func() time.Time
+	maxConcurrency     int
+	softmaxTemperature float64
+	now                func() time.Time
 }
 
 // Option configures an [Evaluator].
@@ -28,6 +37,37 @@ type Option func(*options)
 // [DefaultMaxConcurrency].
 func WithMaxConcurrency(n int) Option {
 	return func(o *options) { o.maxConcurrency = n }
+}
+
+// WithSoftmaxTemperature sets the temperature the candidate logits of one
+// question are softmaxed at, which is how sharp or how flat the reported
+// distribution is. The default is [DefaultSoftmaxTemperature].
+//
+// This is not the sampling temperature. [Request.Temperature] and
+// PERCEPTEA_TEMPERATURE are sent to the provider and decide how the model
+// draws its tokens; this one is never sent anywhere and decides only how this
+// package turns the independent per-candidate probabilities it got back into
+// one distribution. The two are unrelated settings that happen to share a
+// word.
+//
+// Raising it flattens the distribution, lowering it sharpens one. Neither can
+// change an answer: dividing every logit of a question by the same positive
+// number is monotone, so the order of the candidates — and therefore the
+// argmax a choice reports and the ranking a caller reads — is identical at
+// every temperature. What moves is calibration, which is worth fitting on a
+// labelled set; see the README.
+//
+// A value that is not a positive, finite number is ignored and leaves the
+// default in place, rather than poisoning every distribution the Evaluator
+// goes on to produce: a NaN here would spread into every probability and
+// confidence of every question. Where the value comes from a configuration
+// file it is rejected at startup instead; see internal/config.
+func WithSoftmaxTemperature(t float64) Option {
+	return func(o *options) {
+		if t > 0 && !math.IsInf(t, 1) {
+			o.softmaxTemperature = t
+		}
+	}
 }
 
 // WithClock replaces the source of the current time, which is used only to
@@ -47,7 +87,12 @@ func WithClock(now func() time.Time) Option {
 type Evaluator struct {
 	scorer         Scorer
 	maxConcurrency int
-	now            func() time.Time
+	// softmaxTemperature is the softmax temperature every distribution this
+	// Evaluator reports is normalised at — not the sampling temperature,
+	// which travels on the request and never comes near this field. See
+	// [WithSoftmaxTemperature].
+	softmaxTemperature float64
+	now                func() time.Time
 }
 
 // New returns an Evaluator backed by s.
@@ -56,14 +101,46 @@ type Evaluator struct {
 // then returns [ErrNoScorer], which keeps a misconfiguration a request-time
 // error instead of a crash at wiring time.
 func New(s Scorer, opts ...Option) *Evaluator {
-	cfg := options{maxConcurrency: DefaultMaxConcurrency, now: time.Now}
+	cfg := options{
+		maxConcurrency:     DefaultMaxConcurrency,
+		softmaxTemperature: DefaultSoftmaxTemperature,
+		now:                time.Now,
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
 	}
-	return &Evaluator{scorer: s, maxConcurrency: cfg.maxConcurrency, now: cfg.now}
+	return &Evaluator{
+		scorer:             s,
+		maxConcurrency:     cfg.maxConcurrency,
+		softmaxTemperature: cfg.softmaxTemperature,
+		now:                cfg.now,
+	}
 }
+
+// softmaxT is the temperature this Evaluator normalises at, with the same
+// defensiveness [Evaluator.Evaluate] shows the clock: an Evaluator assembled
+// as a struct literal rather than through [New] has a zero here, and a zero
+// would be floored to [minTemperature] by the softmax and silently sharpen
+// every distribution it reported.
+func (e *Evaluator) softmaxT() float64 {
+	if e == nil || !(e.softmaxTemperature > 0) {
+		return DefaultSoftmaxTemperature
+	}
+	return e.softmaxTemperature
+}
+
+// SoftmaxTemperature reports the softmax temperature this Evaluator
+// normalises every distribution at — [DefaultSoftmaxTemperature] unless
+// [WithSoftmaxTemperature] set another.
+//
+// It is here because this one setting scales every probability and every
+// confidence an answer carries, so the wiring that delivers it is worth being
+// able to read back: whoever assembles an Evaluator from a configuration can
+// check that what they configured is what it will use, instead of inferring it
+// from the numbers afterwards.
+func (e *Evaluator) SoftmaxTemperature() float64 { return e.softmaxT() }
 
 // Evaluate answers every question in req.
 //
@@ -246,13 +323,19 @@ func tokensOf(results [][]ScoreResult) (in, out int) {
 }
 
 // parallelEvaluation folds a completed wave's results into an evaluation,
-// normalising each question's candidates into its answer.
-func parallelEvaluation(qs Questions, results [][]ScoreResult, calls int) evaluation {
+// normalising each question's candidates into its answer at the given softmax
+// temperature.
+//
+// The temperature is a parameter rather than read from an [Evaluator] because
+// both entry points fold their waves through here — one evaluation and every
+// item of a batch — and a default reached for in this one place would be the
+// configured value silently missing from both.
+func parallelEvaluation(qs Questions, results [][]ScoreResult, calls int, softmaxTemperature float64) evaluation {
 	in, out := tokensOf(results)
 	ev := evaluation{answers: *NewOrderedMap[Answer](), inputTokens: in, outputTokens: out, calls: calls}
 	for qi, name := range qs.Keys() {
 		q, _ := qs.Get(name)
-		ev.answers.Set(name, answerFor(q, results[qi]))
+		ev.answers.Set(name, answerFor(q, results[qi], softmaxTemperature))
 	}
 	return ev
 }
@@ -276,7 +359,7 @@ func (e *Evaluator) evaluateParallel(ctx context.Context, req Request, state str
 	if err := group.failure(); err != nil {
 		return evaluation{}, err
 	}
-	return parallelEvaluation(req.Questions, results, len(tasks)), nil
+	return parallelEvaluation(req.Questions, results, len(tasks), e.softmaxT()), nil
 }
 
 // scoreCalls turns candidates into the calls that score them, each writing its
@@ -459,8 +542,9 @@ func stoppedByContext(groups []*waveGroup) bool {
 	return false
 }
 
-// answerFor normalises one question's independent scores into its answer.
-func answerFor(q Question, results []ScoreResult) Answer {
+// answerFor normalises one question's independent scores into its answer at
+// the given softmax temperature.
+func answerFor(q Question, results []ScoreResult, softmaxTemperature float64) Answer {
 	raw := make([]float64, len(results))
 	for i, r := range results {
 		// A Scorer is an interface, so its answer is input, not a value this
@@ -470,11 +554,11 @@ func answerFor(q Question, results []ScoreResult) Answer {
 
 	switch q.Type {
 	case TypeChoice:
-		probs := scoresToDistribution(raw)
+		probs := scoresToDistribution(raw, softmaxTemperature)
 		keys := q.Options.Keys()
 		distribution := NewOrderedMap[float64]()
 		for i, key := range keys {
-			distribution.Set(key, round3(probs[i]))
+			distribution.Set(key, round6(probs[i]))
 		}
 		answer := Answer{
 			Type:          TypeChoice,
@@ -487,7 +571,7 @@ func answerFor(q Question, results []ScoreResult) Answer {
 		return answer
 
 	case TypeScore:
-		probs := scoresToDistribution(raw)
+		probs := scoresToDistribution(raw, softmaxTemperature)
 		score := 0.0
 		legend := NewOrderedMap[string]()
 		distribution := NewOrderedMap[float64]()
@@ -505,7 +589,7 @@ func answerFor(q Question, results []ScoreResult) Answer {
 			score += float64(p * float64(i))
 			key := strconv.Itoa(i)
 			legend.Set(key, q.Levels[i])
-			distribution.Set(key, round3(p))
+			distribution.Set(key, round6(p))
 		}
 		return Answer{
 			Type:          TypeScore,
@@ -517,11 +601,19 @@ func answerFor(q Question, results []ScoreResult) Answer {
 
 	default:
 		// A noul answer is the raw probability: there is nothing to normalise
-		// against and so no confidence to report.
+		// against and so no confidence to report, and no softmax either — the
+		// temperature has nothing to act on and does not reach here.
+		//
+		// This is the one reported probability that may legitimately be 0 or
+		// 1: it is the [Scorer]'s own number with nothing but
+		// [sanitiseProbability]'s clamp between it and the wire, so a scorer
+		// that answered 1 is reported as 1. [round6] still applies, so a
+		// scorer that answered 0.9996 is reported as 0.9996 and not rounded up
+		// into a certainty it did not claim.
 		var p float64
 		if len(raw) > 0 {
 			p = raw[0]
 		}
-		return Answer{Type: TypeNoul, Noul: round3(p)}
+		return Answer{Type: TypeNoul, Noul: round6(p)}
 	}
 }

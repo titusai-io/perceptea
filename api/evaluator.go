@@ -90,10 +90,17 @@ func (f *evaluatorFactory) newEvaluator(st Settings) (Evaluator, error) {
 	if n < 1 {
 		n = config.DefaultMaxConcurrency
 	}
+	t := st.SoftmaxTemperature
+	if !(t > 0) {
+		t = config.DefaultSoftmaxTemperature
+	}
 	// The classifier wrapper is cheap and holds no state worth keeping, so
-	// only the client below it is cached; MaxConcurrency is therefore not
-	// part of the cache key.
-	return classifier.New(c, classifier.WithMaxConcurrency(n)), nil
+	// only the client below it is cached; MaxConcurrency and the softmax
+	// temperature are therefore not part of the cache key.
+	return classifier.New(c,
+		classifier.WithMaxConcurrency(n),
+		classifier.WithSoftmaxTemperature(t),
+	), nil
 }
 
 // clientKey identifies a provider client by everything it is built from.
@@ -108,7 +115,8 @@ func (f *evaluatorFactory) newEvaluator(st Settings) (Evaluator, error) {
 // same one and the key gains no entries by including it. It is here because
 // the client is *built* from it — it goes into every request body the client
 // sends — and the rule this key follows is that everything the client is made
-// of is in it. MaxConcurrency, which the client is not made of, stays out.
+// of is in it. MaxConcurrency and SoftmaxTemperature, which the client is not
+// made of — the softmax happens after every call has come back — stay out.
 // Were a per-request effort ever allowed, leaving it out would quietly serve
 // the first caller's client to the second.
 func clientKey(st Settings) string {

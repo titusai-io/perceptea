@@ -55,6 +55,16 @@ type Settings struct {
 	Scorer string
 	// MaxConcurrency bounds the scoring calls one evaluation runs at once.
 	MaxConcurrency int
+	// SoftmaxTemperature is the temperature a question's candidate logits
+	// are softmaxed at. Like ReasoningEffort and Scorer it is the operator's
+	// choice and a request body cannot name one — it is what a reported
+	// probability is calibrated by, and a caller who could change it could
+	// change what a threshold means between two requests.
+	//
+	// It is not the sampling temperature, which travels on the request as
+	// resolution.temperature and goes to the provider. This one never leaves
+	// the process.
+	SoftmaxTemperature float64
 }
 
 // Options configures [NewServer].
@@ -83,6 +93,12 @@ func NewServer(opts Options) (*Server, error) {
 	cfg := opts.Config
 	if cfg.MaxConcurrency < 1 {
 		cfg.MaxConcurrency = config.DefaultMaxConcurrency
+	}
+	// Not > 0 rather than <= 0, so that a NaN that reached a Config built in
+	// Go takes the default too: the loader refuses one, but this struct is
+	// exported and a caller may fill it in themselves.
+	if !(cfg.SoftmaxTemperature > 0) {
+		cfg.SoftmaxTemperature = config.DefaultSoftmaxTemperature
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = config.DefaultRequestTimeout

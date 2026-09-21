@@ -11,6 +11,28 @@ always called out below.
 
 ### Added
 
+- **`PERCEPTEA_SOFTMAX_TEMPERATURE`, the divisor a question's candidate
+  logits are softmaxed at.** It is not `PERCEPTEA_TEMPERATURE`, which is the
+  sampling temperature the provider is sent; this one is never sent anywhere
+  and only decides how sharply the probabilities that came back are
+  normalised into a distribution. It **cannot change an answer**: dividing
+  every logit of a question by the same positive number is monotone, so no
+  argmax and no ranking can move, at any temperature. What moves is
+  calibration. Fitted by minimising the negative log likelihood of the true
+  label over a held-out set of 764 questions on
+  `mistralai/Mistral-Small-24B-Instruct-2501`, the best temperature is 5.04,
+  the same on either half of a random split; cross-fitted, expected
+  calibration error falls from 0.158 to 0.103 and Brier from 0.430 to 0.417
+  with accuracy unchanged at 0.712, as it has to be. The **default is 1**,
+  the identity, because that value is fitted to one model on one task and no
+  existing deployment's numbers should move without being asked to; the
+  README's [The softmax temperature](README.md#the-softmax-temperature) is
+  the procedure for fitting your own. `0`, a negative, a NaN or a word stops
+  the process at startup naming the variable, rather than being floored to
+  0.05 by the transform without a word. `classifier.WithSoftmaxTemperature`
+  is the library form, `cmd/perceptea-bench` honours it so a benchmark
+  measures the configuration being served, and the startup line reports it.
+
 - **Every scoring call is shown its question's candidate list.** The call
   judging one option used to be given no hint that the others existed, which
   is most of what a "which of these?" question is. The whole list now renders
@@ -141,6 +163,28 @@ always called out below.
 - **`requests/deepinfra-requests.http`**: runnable examples of every question
   type, the options, worked examples, batches — including a partial failure —
   and every failure mode.
+
+### Changed
+
+- **A reported probability is no longer ever an exact `0` or an exact `1`.**
+  Probabilities, `noul` and `confidence` are rounded to six decimal places
+  instead of three; a `score` keeps two, because a score is a position on a
+  declared scale and not a probability. The per-candidate scores entering the
+  softmax are clamped into `(0.001, 0.999)`, so no candidate is ever
+  certainly right or certainly wrong, and the most extreme distribution the
+  service can reach is 0.999999 against 0.000001 — which three decimals
+  published as an exact `1` and `0`, a claim the estimator cannot make. It
+  was also a dead end: renormalising or re-tempering a published distribution
+  needs `log(p)`. Six is the smallest precision that holds; five still
+  reports that extreme as `1`. Finer rounding also tightens the
+  sum-to-1 claim the README makes — the published numbers now total 1 to
+  within half of the last place per candidate, at most 1.3e-4 for a 255-way
+  choice against 0.13 before. Two things are unchanged and deliberate: a
+  `noul` may still be `0` or `1`, because it is the model's own probability
+  with no softmax between it and the wire, and a probability below 5e-7 still
+  rounds to `0` — reachable only where a model scored three or more
+  candidates of the same question at 0.999 while scoring another at 0.001,
+  and no fixed precision survives that.
 
 ### Security
 
