@@ -1,11 +1,24 @@
 name: CI
 
 on:
+  # A branch with an open pull request gets a push event and a
+  # pull_request event for the same commit, so an unfiltered push trigger
+  # runs everything twice. Pushes to main are the ones no pull request
+  # covers; everything else arrives as a pull request, including from a
+  # fork.
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+# A new push supersedes the run in flight for the same ref. main is exempt:
+# its runs say whether a merged commit is good, and cancelling one leaves
+# that unanswered.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:

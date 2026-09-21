@@ -650,7 +650,8 @@ tests its client against `httptest` servers.
 
 CI runs `gofmt`, `go mod tidy` (with `git diff --exit-code` behind it, so the
 zero-dependency claim at the top of this file is checked rather than trusted),
-`go vet`, `go build` and `go test -race` on every push and pull request.
+`go vet`, `go build` and `go test -race` on every pull request, including
+from a fork, and on every push to `main`.
 
 ## Contributing
 
