@@ -57,7 +57,13 @@ type GenerateRequest struct {
 
 // GenerateResult is the model's reply and what it cost.
 type GenerateResult struct {
-	Content      string
+	Content string
+	// FinishReason is why the provider stopped generating, verbatim, or ""
+	// when it said nothing. "length" means the reply was cut off at an
+	// output token limit rather than finished, which is the difference
+	// between a document the model got wrong and a document it never got
+	// to the end of. See [ErrTruncatedReply].
+	FinishReason string
 	InputTokens  int
 	OutputTokens int
 }

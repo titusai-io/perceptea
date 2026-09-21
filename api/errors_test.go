@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -158,6 +161,22 @@ func TestEvaluateErrorTable(t *testing.T) {
 			wantCode:   codeUpstreamError,
 		},
 		{
+			name: "the provider cut the reply off at the token limit",
+			err: fmt.Errorf("%w: the 32 token cap on a scoring call is spent on thinking tokens by a model "+
+				"that reasons, so the reply ends before the JSON. Use a model that does not reason, or set "+
+				"PERCEPTEA_REASONING_EFFORT to %q", inference.ErrTruncatedReply, "none"),
+			wantStatus:  http.StatusBadGateway,
+			wantCode:    codeUpstreamError,
+			wantMessage: "PERCEPTEA_REASONING_EFFORT",
+		},
+		{
+			name:        "a one-shot document that never finished",
+			err:         fmt.Errorf("%w; raise the provider's output token limit: {\"a\":", classifier.ErrTruncatedReply),
+			wantStatus:  http.StatusBadGateway,
+			wantCode:    codeUpstreamError,
+			wantMessage: "cut off",
+		},
+		{
 			name: "a transport failure",
 			err: fmt.Errorf("inference: chat completion: %w", &url.Error{
 				Op:  "Post",
@@ -228,6 +247,62 @@ func TestAnUpstreamFailureBeatsTheDeadlineItRanInto(t *testing.T) {
 		&inference.APIError{StatusCode: http.StatusBadGateway, Message: "upstream unavailable"}))
 
 	h.expectError(h.post(validBody), http.StatusBadGateway, codeUpstreamError)
+}
+
+// End to end, with the real provider client behind the server and a fake
+// endpoint in front of it: a model that spends the 32 token scoring budget on
+// thinking tokens used to produce 0.5 for every candidate and a 200 carrying
+// a uniform distribution that looked like an answer. It must produce a 502
+// that says what happened and how to fix it.
+func TestATruncatedUpstreamReplyIsAnActionable502(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":null,`+
+			`"reasoning":"Okay, the user wants a probability. The state says"},"finish_reason":"length"}],`+
+			`"usage":{"prompt_tokens":120,"completion_tokens":32}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	logs := &bytes.Buffer{}
+	srv, err := NewServer(Options{
+		Config: config.Config{
+			BaseURL:        upstream.URL,
+			APIKey:         testKey,
+			Model:          "probe-1",
+			RequestTimeout: 5 * time.Second,
+		},
+		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/evaluate", strings.NewReader(validBody)))
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body: %s)", w.Code, w.Body.String())
+	}
+	var body errorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding the error body: %v (%s)", err, w.Body.String())
+	}
+	if body.Code != codeUpstreamError {
+		t.Errorf("code = %q, want %q", body.Code, codeUpstreamError)
+	}
+	// Everything the operator needs is in the one line they will read.
+	for _, want := range []string{
+		"cut off", "output token limit", "thinking tokens",
+		"does not reason", config.EnvReasoningEffort, config.EffortNone,
+	} {
+		if !strings.Contains(body.Error, want) {
+			t.Errorf("the caller was not told %q: %s", want, body.Error)
+		}
+	}
+	// And not the package name it carries for the log.
+	if strings.Contains(body.Error, "inference: ") {
+		t.Errorf("the message still carries its package prefix: %s", body.Error)
+	}
 }
 
 // brokenReader hands over a prefix and then fails, the way a connection does

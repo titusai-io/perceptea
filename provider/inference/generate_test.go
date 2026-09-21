@@ -72,6 +72,57 @@ func TestGenerateSendsTheExpectedRequest(t *testing.T) {
 	}
 }
 
+// The one-shot path has no token cap of its own, so a cut-off document means
+// the provider's own output limit ran out. Only the caller can tell that from
+// a model that answered badly, so the reason is reported rather than judged.
+func TestGenerateReportsTheFinishReason(t *testing.T) {
+	for _, tc := range []struct{ name, sent, want string }{
+		{"finished", "stop", "stop"},
+		{"cut off at the limit", "length", "length"},
+		{"none reported", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := alwaysJSON(t, replyFixture{content: `{"a":{"noul":0.9}}`, finishReason: tc.sent}.body())
+			client, _ := newTestClient(t, api, nil)
+
+			got, err := client.Generate(context.Background(), fixtureGenerate)
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			if got.FinishReason != tc.want {
+				t.Errorf("FinishReason = %q, want %q", got.FinishReason, tc.want)
+			}
+			if got.Content != `{"a":{"noul":0.9}}` {
+				t.Errorf("content = %q", got.Content)
+			}
+		})
+	}
+}
+
+func TestGenerateSendsNoReasoningEffortUnlessOneIsConfigured(t *testing.T) {
+	api := alwaysJSON(t, generateBody("ok"))
+	client, _ := newTestClient(t, api, nil)
+
+	if _, err := client.Generate(context.Background(), fixtureGenerate); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if _, present := api.request(t, 0).body(t)["reasoning_effort"]; present {
+		t.Error("reasoning_effort was sent although none is configured")
+	}
+}
+
+func TestGenerateSendsTheConfiguredReasoningEffort(t *testing.T) {
+	api := alwaysJSON(t, generateBody("ok"))
+	client, _ := newTestClient(t, api, func(cfg *Config) { cfg.ReasoningEffort = "none" })
+
+	if _, err := client.Generate(context.Background(), fixtureGenerate); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if got := api.request(t, 0).body(t)["reasoning_effort"]; got != "none" {
+		t.Errorf("reasoning_effort = %v, want %q", got, "none")
+	}
+}
+
 func TestGenerateOmitsResponseFormatWhenNotAskedFor(t *testing.T) {
 	api := alwaysJSON(t, generateBody("plain text"))
 	client, _ := newTestClient(t, api, nil)

@@ -15,6 +15,7 @@ import (
 type fakeGenerator struct {
 	t            *testing.T
 	content      string
+	finishReason string
 	err          error
 	inputTokens  int
 	outputTokens int
@@ -41,6 +42,7 @@ func (f *fakeGenerator) Generate(_ context.Context, req GenerateRequest) (Genera
 	}
 	return GenerateResult{
 		Content:      f.content,
+		FinishReason: f.finishReason,
 		InputTokens:  f.inputTokens,
 		OutputTokens: f.outputTokens,
 	}, nil
@@ -289,6 +291,48 @@ func TestEvaluateOneshotNonJSONIsTruncated(t *testing.T) {
 	}
 	if strings.ContainsRune(quoted, '�') {
 		t.Error("the quoted reply was cut in the middle of a character")
+	}
+}
+
+// A document that stops mid-way is not a model that answered badly, and
+// "returned non-JSON" sends whoever reads it looking for the wrong fault:
+// there is nothing wrong with the JSON, there is only less of it than there
+// should be. The fix is an output limit or a model that does not spend the
+// budget thinking, so that is what the error says.
+func TestEvaluateOneshotSaysWhenTheReplyWasCutOff(t *testing.T) {
+	const content = `{"department":{"choice":"billing","confidence":0.8},"urg`
+
+	generator := &fakeGenerator{t: t, content: content, finishReason: "length"}
+	_, err := New(generator).Evaluate(context.Background(), oneshotRequest(t))
+	if err == nil {
+		t.Fatal("Evaluate accepted a reply that was cut off mid-document")
+	}
+	if !errors.Is(err, ErrTruncatedReply) {
+		t.Fatalf("Evaluate returned %v, want ErrTruncatedReply", err)
+	}
+	for _, want := range []string{"cut off", "output token limit", "thinking tokens", content} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %q: %s", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "non-JSON") {
+		t.Errorf("a truncated reply is still reported as a document that was not JSON: %s", err)
+	}
+}
+
+// The same broken document without the finish reason is the old diagnosis,
+// and still the right one: nothing says the reply ran out of room.
+func TestEvaluateOneshotStillSaysNonJSONWhenTheReplyFinished(t *testing.T) {
+	generator := &fakeGenerator{t: t, content: `{"department":{"choice":"bill`, finishReason: "stop"}
+	_, err := New(generator).Evaluate(context.Background(), oneshotRequest(t))
+	if err == nil {
+		t.Fatal("Evaluate accepted a broken document")
+	}
+	if errors.Is(err, ErrTruncatedReply) {
+		t.Fatalf("a reply that finished normally was reported as truncated: %v", err)
+	}
+	if !strings.Contains(err.Error(), "non-JSON") {
+		t.Errorf("error %q should say the reply was not JSON", err)
 	}
 }
 

@@ -63,6 +63,11 @@ func TestDefaultEvaluatorFactory(t *testing.T) {
 	if got.Model != "probe-1" {
 		t.Errorf("Config.Model = %q", got.Model)
 	}
+	// Unset is the default and has to reach the client as unset: the client
+	// sends no reasoning field at all for an empty one.
+	if got.ReasoningEffort != "" {
+		t.Errorf("Config.ReasoningEffort = %q, want it unset", got.ReasoningEffort)
+	}
 	// One evaluation is many calls, so the retry count multiplies: it is a
 	// setting, not a default to drift.
 	if got.MaxRetries != defaultMaxRetries {
@@ -83,6 +88,50 @@ func TestDefaultEvaluatorFactory(t *testing.T) {
 	// time, not once.
 	if n := f.cache.len(); n != 1 {
 		t.Errorf("cached %d clients, want only the one that built", n)
+	}
+}
+
+// The effort is a setting the provider client is built from, so it has to
+// reach it — and has to be part of the cache key, or a client built for one
+// effort would be handed to a request that resolved another. It cannot vary
+// per request today, which is exactly why the key is the cheap place to keep
+// the invariant: including it costs no cache entries while nothing varies,
+// and costs a silent wrong answer if anything ever does.
+func TestTheReasoningEffortReachesTheClientAndTheCacheKey(t *testing.T) {
+	f, built := countingFactory(t)
+	base := Settings{APIKey: testKey, BaseURL: "https://inference.example/v1", Model: "probe-1"}
+
+	withEffort := base
+	withEffort.ReasoningEffort = "none"
+	if _, err := f.newEvaluator(withEffort); err != nil {
+		t.Fatalf("building an evaluator: %v", err)
+	}
+	if len(*built) != 1 {
+		t.Fatalf("built %d clients, want 1", len(*built))
+	}
+	if got := (*built)[0].ReasoningEffort; got != "none" {
+		t.Errorf("Config.ReasoningEffort = %q, want %q", got, "none")
+	}
+
+	// The same settings reuse it...
+	if _, err := f.newEvaluator(withEffort); err != nil {
+		t.Fatalf("building an evaluator: %v", err)
+	}
+	if len(*built) != 1 {
+		t.Errorf("built %d clients for two identical requests, want 1", len(*built))
+	}
+
+	// ...and a different effort does not.
+	for _, effort := range []string{"", "high"} {
+		st := base
+		st.ReasoningEffort = effort
+		before := len(*built)
+		if _, err := f.newEvaluator(st); err != nil {
+			t.Fatalf("building an evaluator: %v", err)
+		}
+		if len(*built) != before+1 {
+			t.Errorf("effort %q reused a client built for a different one", effort)
+		}
 	}
 }
 

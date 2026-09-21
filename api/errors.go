@@ -82,6 +82,20 @@ func (s *Server) classify(err error) failure {
 	}
 
 	switch {
+	// A reply the provider cut off at its output token limit is an upstream
+	// failure like any other 502, and the one whose message the caller most
+	// needs: it is a configuration fault that will hit every candidate of
+	// every request until someone changes the model or the reasoning
+	// setting, and the error's own text says how. Both the parallel and the
+	// one-shot path can raise it.
+	case errors.Is(err, inference.ErrTruncatedReply), errors.Is(err, classifier.ErrTruncatedReply):
+		return failure{
+			status:  http.StatusBadGateway,
+			code:    codeUpstreamError,
+			message: truncatedMessage(err),
+			detail:  err.Error(),
+		}
+
 	// A deadline beats a cancellation: the timeout we imposed also cancels
 	// the request context, and the caller deserves the more specific answer.
 	case errors.Is(err, context.DeadlineExceeded):
@@ -186,6 +200,22 @@ func (s *Server) classifyRead(err error) failure {
 	// request, a reset, a client that hung up mid-body. Nobody is listening,
 	// so nothing is written back.
 	return failure{status: StatusClientClosedRequest, detail: detail}
+}
+
+// truncatedMessage renders a cut-off reply for the caller.
+//
+// Unlike every other upstream failure, the error's own text is already the
+// message worth sending: it names the limit, the cause and the two ways out.
+// Only the package prefix every error in this service carries for the log is
+// dropped, so what the caller reads starts with the finding.
+func truncatedMessage(err error) string {
+	msg := err.Error()
+	for _, prefix := range []string{"inference: ", "classifier: "} {
+		if after, ok := strings.CutPrefix(msg, prefix); ok {
+			return after
+		}
+	}
+	return msg
 }
 
 // upstreamMessage renders a provider error without echoing its raw body.

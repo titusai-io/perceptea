@@ -9,12 +9,17 @@ import (
 // chatRequest is the /chat/completions request document. Temperature carries
 // no omitempty: 0 is the meaningful default for a classifier and must reach
 // the provider.
+//
+// ReasoningEffort does carry omitempty, and that is the whole of its default
+// behaviour: an unconfigured client sends no reasoning field at all, so a
+// provider that has never seen one is asked exactly what it was asked before.
 type chatRequest struct {
-	Model          string          `json:"model"`
-	Messages       []chatMessage   `json:"messages"`
-	Temperature    float64         `json:"temperature"`
-	MaxTokens      int             `json:"max_tokens,omitempty"`
-	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []chatMessage   `json:"messages"`
+	Temperature     float64         `json:"temperature"`
+	MaxTokens       int             `json:"max_tokens,omitempty"`
+	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
 }
 
 // chatMessage is one turn of the prompt.
@@ -44,16 +49,45 @@ type chatResponse struct {
 }
 
 // chatChoice is one candidate completion.
+//
+// FinishReason is why the provider stopped generating. "length" is the one
+// value this package acts on: it means the reply was cut off at the output
+// token limit rather than finished, and a cut-off reply is not an answer.
 type chatChoice struct {
-	Message chatResponseMessage `json:"message"`
+	Message      chatResponseMessage `json:"message"`
+	FinishReason string              `json:"finish_reason"`
 }
 
-// chatResponseMessage is the assistant turn. Reasoning is non-standard but
-// common enough — some providers leave content empty and put the answer there.
+// chatResponseMessage is the assistant turn. The reasoning fields are
+// non-standard but common enough — a model that thinks before it answers puts
+// the thinking in one of them, and several providers leave content empty while
+// doing so. Which of the two names is used is provider-specific, so both are
+// read.
 type chatResponseMessage struct {
-	Content   messageContent `json:"content"`
-	Reasoning messageContent `json:"reasoning"`
+	Content          messageContent `json:"content"`
+	Reasoning        messageContent `json:"reasoning"`
+	ReasoningContent messageContent `json:"reasoning_content"`
 }
+
+// reasoning returns whichever reasoning field the provider populated.
+func (m chatResponseMessage) reasoning() string {
+	if strings.TrimSpace(string(m.Reasoning)) != "" {
+		return string(m.Reasoning)
+	}
+	return string(m.ReasoningContent)
+}
+
+// truncated reports whether a choice was cut off at the output token limit.
+// The comparison is case-insensitive because the value is echoed text, not a
+// protocol constant; nothing else is accepted, because nothing else means the
+// reply ran out of room.
+func (c chatChoice) truncated() bool {
+	return strings.EqualFold(strings.TrimSpace(c.FinishReason), finishReasonLength)
+}
+
+// finishReasonLength is the finish_reason a provider sends when the output
+// token limit, not the model, ended the reply.
+const finishReasonLength = "length"
 
 // chatUsage is the token accounting. Absent fields stay zero, which is exactly
 // what [classifier.ScoreResult] wants.

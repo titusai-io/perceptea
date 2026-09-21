@@ -71,14 +71,15 @@ func newEvaluatorFactory(logger *slog.Logger) *evaluatorFactory {
 func (f *evaluatorFactory) newEvaluator(st Settings) (Evaluator, error) {
 	c, err := f.cache.get(clientKey(st), func() (*inference.Client, error) {
 		return f.newClient(inference.Config{
-			APIKey:     st.APIKey,
-			BaseURL:    st.BaseURL,
-			Model:      st.Model,
-			HTTPClient: f.client,
-			MaxRetries: defaultMaxRetries,
-			Referer:    attributionURL,
-			Title:      attributionTitle,
-			Logger:     f.logger,
+			APIKey:          st.APIKey,
+			BaseURL:         st.BaseURL,
+			Model:           st.Model,
+			ReasoningEffort: st.ReasoningEffort,
+			HTTPClient:      f.client,
+			MaxRetries:      defaultMaxRetries,
+			Referer:         attributionURL,
+			Title:           attributionTitle,
+			Logger:          f.logger,
 		})
 	})
 	if err != nil {
@@ -100,9 +101,18 @@ func (f *evaluatorFactory) newEvaluator(st Settings) (Evaluator, error) {
 // credentials is a credential store nobody asked for, and would put every key
 // the service has ever been handed into a heap dump. Each part is
 // length-prefixed so that two different splits cannot produce one key.
+//
+// The reasoning effort is in the key although today it cannot vary: it comes
+// from the server's configuration, so every request in a process resolves the
+// same one and the key gains no entries by including it. It is here because
+// the client is *built* from it — it goes into every request body the client
+// sends — and the rule this key follows is that everything the client is made
+// of is in it. MaxConcurrency, which the client is not made of, stays out.
+// Were a per-request effort ever allowed, leaving it out would quietly serve
+// the first caller's client to the second.
 func clientKey(st Settings) string {
 	sum := sha256.New()
-	for _, part := range []string{st.BaseURL, st.Model, st.APIKey} {
+	for _, part := range []string{st.BaseURL, st.Model, st.APIKey, st.ReasoningEffort} {
 		fmt.Fprintf(sum, "%d:%s", len(part), part)
 	}
 	return hex.EncodeToString(sum.Sum(nil))

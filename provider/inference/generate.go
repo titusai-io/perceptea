@@ -13,6 +13,10 @@ import (
 // document. It also only ever asks for json_object, never json_schema: a
 // one-shot reply has no fixed schema to declare.
 //
+// The provider's finish reason is reported on the result rather than judged
+// here, because only the caller can tell a document the model got wrong from
+// one it never reached the end of.
+//
 // When req.JSONObject is set the call asks for a JSON object and drops that
 // request for the rest of the call if the provider rejects the shape, on the
 // same negotiation Score uses and under the same rule: the drop is only
@@ -38,9 +42,10 @@ func (c *Client) Generate(ctx context.Context, req classifier.GenerateRequest) (
 	dropped := false
 	for {
 		body := chatRequest{
-			Model:       model,
-			Messages:    messages,
-			Temperature: req.Temperature,
+			Model:           model,
+			Messages:        messages,
+			Temperature:     req.Temperature,
+			ReasoningEffort: c.reasoningEffort,
 		}
 		if asking {
 			body.ResponseFormat = &responseFormat{Type: "json_object"}
@@ -63,11 +68,17 @@ func (c *Client) Generate(ctx context.Context, req classifier.GenerateRequest) (
 			OutputTokens: resp.Usage.CompletionTokens,
 		}
 		if len(resp.Choices) > 0 {
-			content := string(resp.Choices[0].Message.Content)
+			choice := resp.Choices[0]
+			content := string(choice.Message.Content)
 			if strings.TrimSpace(content) == "" {
-				content = string(resp.Choices[0].Message.Reasoning)
+				content = choice.Message.reasoning()
 			}
 			out.Content = content
+			// The finish reason is reported rather than acted on here: only
+			// the caller knows whether what did arrive was a usable
+			// document, and a reply cut off after the last answer is still
+			// an answer.
+			out.FinishReason = choice.FinishReason
 		}
 		return out, nil
 	}

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"regexp"
 	"strconv"
@@ -32,7 +34,25 @@ const maxScoreTokens = 32
 // fallbackProbability is the answer when nothing usable comes back. A
 // candidate that cannot be read is maximally uninformative, not an error: one
 // bad candidate should blunt one score, not fail the whole evaluation.
+//
+// The one exception is a reply the provider cut off at the output token
+// limit; see [ErrTruncatedReply].
 const fallbackProbability = 0.5
+
+// ErrTruncatedReply reports a scoring reply that the provider stopped at the
+// output token limit before it said anything this package could read.
+//
+// It is the one unreadable reply that is an error rather than a 0.5. Every
+// other unreadable reply is a one-off: the model said something odd about one
+// candidate, and blunting that one score is the proportionate answer. A
+// truncated reply is not a one-off — the cap is the same on every call in the
+// request, so every candidate comes back unreadable, every score is 0.5, and
+// the softmax turns a uniform set of scores into a confident-looking answer
+// that carries no information at all. That failure is silent, and silence is
+// the worst property an answer can have, so this one fails loudly instead.
+//
+// Callers classify it with [errors.Is]; the wrapped error carries the detail.
+var ErrTruncatedReply = errors.New("inference: the reply was cut off at the output token limit before a probability could be read")
 
 // scoreSchemaName is the json_schema name sent at level one.
 const scoreSchemaName = "prob"
@@ -63,7 +83,9 @@ var probabilityPattern = regexp.MustCompile(`0?\.\d+|[01](?:\.0+)?`)
 //
 // Anything short of a transport or API failure yields a probability: an empty
 // choices list, an unparseable reply and a reply with no number in it all
-// degrade to 0.5 rather than returning an error.
+// degrade to 0.5 rather than returning an error. The exception is a reply that
+// was cut off at the output token limit and carried no probability, which
+// returns [ErrTruncatedReply]: see there for why that one is not forgiven.
 func (c *Client) Score(ctx context.Context, req classifier.ScoreRequest) (classifier.ScoreResult, error) {
 	model, err := c.resolveModel(req.Model)
 	if err != nil {
@@ -81,11 +103,12 @@ func (c *Client) Score(ctx context.Context, req classifier.ScoreRequest) (classi
 	// loop runs at most once per level.
 	for level := started; ; level++ {
 		body := chatRequest{
-			Model:          model,
-			Messages:       messages,
-			Temperature:    req.Temperature,
-			MaxTokens:      maxScoreTokens,
-			ResponseFormat: scoreResponseFormat(level),
+			Model:           model,
+			Messages:        messages,
+			Temperature:     req.Temperature,
+			MaxTokens:       maxScoreTokens,
+			ResponseFormat:  scoreResponseFormat(level),
+			ReasoningEffort: c.reasoningEffort,
 		}
 
 		resp, err := c.complete(ctx, body)
@@ -93,7 +116,7 @@ func (c *Client) Score(ctx context.Context, req classifier.ScoreRequest) (classi
 			if level > started {
 				c.downgrade(level)
 			}
-			return scoreResult(resp), nil
+			return scoreResult(resp)
 		}
 		if body.ResponseFormat != nil && unsupportedShape(err) {
 			continue
@@ -122,48 +145,96 @@ func scoreResponseFormat(level outputLevel) *responseFormat {
 	}
 }
 
-// scoreResult turns a completion into a score.
-func scoreResult(resp *chatResponse) classifier.ScoreResult {
+// scoreResult turns a completion into a score, or into the error a reply the
+// provider cut short has earned.
+func scoreResult(resp *chatResponse) (classifier.ScoreResult, error) {
 	out := classifier.ScoreResult{
 		Probability:  fallbackProbability,
 		InputTokens:  resp.Usage.PromptTokens,
 		OutputTokens: resp.Usage.CompletionTokens,
 	}
 	if len(resp.Choices) == 0 {
-		return out
+		return out, nil
 	}
-	raw := string(resp.Choices[0].Message.Content)
+
+	choice := resp.Choices[0]
+	raw := string(choice.Message.Content)
 	if strings.TrimSpace(raw) == "" {
 		// Some providers put everything in a reasoning field and leave
 		// content null.
-		raw = string(resp.Choices[0].Message.Reasoning)
+		raw = choice.Message.reasoning()
 	}
-	out.Probability = probabilityFrom(raw)
-	return out
+
+	// A truncated reply that still managed to say a number said it before it
+	// ran out of room, and is an answer like any other. Only a truncated
+	// reply with nothing readable in it is the failure worth reporting.
+	if p, ok := probabilityFrom(raw); ok {
+		out.Probability = p
+		return out, nil
+	}
+	if choice.truncated() {
+		return classifier.ScoreResult{}, truncatedScoreError(choice)
+	}
+	return out, nil
 }
+
+// truncatedScoreError explains one cut-off reply and what to do about it. The
+// message is written for whoever has to fix it — an operator reading a 502,
+// not a maintainer reading a stack — so it names the cap, the usual cause and
+// both fixes.
+func truncatedScoreError(choice chatChoice) error {
+	detail := fmt.Sprintf("the %d token cap on a scoring call is spent on thinking tokens by a model that reasons, "+
+		"so the reply ends before the JSON", maxScoreTokens)
+	// The smoking gun, when the reply left it: nothing in content, and a
+	// reasoning field with something in it. That is a thinking model under a
+	// small cap and nothing else.
+	if strings.TrimSpace(string(choice.Message.Content)) == "" {
+		if reasoning := strings.TrimSpace(choice.Message.reasoning()); reasoning != "" {
+			detail += fmt.Sprintf("; this reply's content was empty while its reasoning field held %d characters",
+				len([]rune(reasoning)))
+		}
+	}
+	return fmt.Errorf("%w: %s. Use a model that does not reason, or set %s to %q",
+		ErrTruncatedReply, detail, envReasoningEffort, effortNone)
+}
+
+// The configuration this package's errors point at. They are spelled out
+// rather than imported: a provider client is usable on its own, and must not
+// depend on the server that happens to configure it. A test asserts that
+// they still match the setting the server actually reads.
+const (
+	envReasoningEffort = "PERCEPTEA_REASONING_EFFORT"
+	effortNone         = "none"
+)
 
 // probabilityFrom reads a probability out of a model reply, forgivingly and in
 // this order: parse the reply as JSON and read "p" then "probability"; failing
-// that, salvage the first number in the raw text; failing that, 0.5. A
-// markdown fence around the JSON is stripped first.
+// that, salvage the first number in the raw text. It reports whether it read
+// one at all; a caller that has no better idea uses [fallbackProbability].
+//
+// A markdown fence around the JSON is stripped first.
 //
 // The salvage regexp only runs on a reply that is not JSON at all. A reply
 // that is JSON is read as JSON or not at all: once a reply has a structure,
 // the structure is what it meant, and scraping a number out of a document
 // that put none under "p" would promote some other field to an answer.
-func probabilityFrom(raw string) float64 {
+func probabilityFrom(raw string) (float64, bool) {
 	if candidate := strings.TrimSpace(stripFence(raw)); candidate != "" {
 		var doc json.RawMessage
 		if err := json.Unmarshal([]byte(candidate), &doc); err == nil {
-			return clamp01(probabilityFromJSON(doc))
+			v, ok := probabilityFromJSON(doc)
+			if !ok {
+				return 0, false
+			}
+			return clamp01(v), true
 		}
 	}
 	if match := probabilityPattern.FindString(raw); match != "" {
 		if v, err := strconv.ParseFloat(match, 64); err == nil {
-			return clamp01(v)
+			return clamp01(v), true
 		}
 	}
-	return fallbackProbability
+	return 0, false
 }
 
 // probabilityFromJSON reads the probability out of a reply that did parse as
@@ -177,41 +248,40 @@ func probabilityFrom(raw string) float64 {
 //     how encoding/json resolves a field name. A model that shouts its key
 //     still means the same thing, and no other key can collide with these two.
 //   - A value that is present but not a number at all — {"p":""}, {"p":" "},
-//     {"p":[]} — is read as no answer, so the reply falls back to 0.5.
-//     Coercing an empty string to 0 would report a confident "certainly false"
-//     on the strength of a field the model left blank.
+//     {"p":[]} — is read as no answer. Coercing an empty string to 0 would
+//     report a confident "certainly false" on the strength of a field the
+//     model left blank.
 //   - A bare top-level number is accepted. A reply of exactly 0.28 is an
 //     answer to the question that was asked, and throwing it away for want of
 //     a wrapping object would discard a probability the model did report.
-func probabilityFromJSON(doc json.RawMessage) float64 {
+func probabilityFromJSON(doc json.RawMessage) (float64, bool) {
 	var obj struct {
 		P           json.RawMessage `json:"p"`
 		Probability json.RawMessage `json:"probability"`
 	}
 	if err := json.Unmarshal(doc, &obj); err == nil {
 		if v, ok := numberFrom(obj.P); ok {
-			return v
+			return v, true
 		}
 		if v, ok := numberFrom(obj.Probability); ok {
-			return v
+			return v, true
 		}
-		return fallbackProbability
+		return 0, false
 	}
 	// Not an object. A bare number is unambiguous — but only while it is
 	// already a probability. Clamping a bare 12 or 85 to 1 would turn a reply
 	// that plainly is not a probability into maximum confidence, and so would
 	// handing it to the salvage regexp, which reads the leading "1" out of 12
-	// and out of 100. Out of range, the reply says nothing usable, and the
-	// fallback is the honest answer.
+	// and out of 100. Out of range, the reply says nothing usable.
 	if v, ok := numberFrom(doc); ok && v >= 0 && v <= 1 {
-		return v
+		return v, true
 	}
-	return fallbackProbability
+	return 0, false
 }
 
 // numberFrom coerces a JSON value to a number: numbers pass through, numeric
-// strings are parsed, booleans become 1 and 0, and anything non-finite
-// collapses to the fallback. Anything else reports that it is not a number at
+// strings are parsed, and booleans become 1 and 0. Anything else — a blank
+// field, an array, a non-finite value — reports that it is not a number at
 // all, which is what keeps a blank field from being read as a zero.
 func numberFrom(raw json.RawMessage) (float64, bool) {
 	trimmed := bytes.TrimSpace(raw)
@@ -221,7 +291,7 @@ func numberFrom(raw json.RawMessage) (float64, bool) {
 
 	var f float64
 	if err := json.Unmarshal(trimmed, &f); err == nil {
-		return finite(f), true
+		return finite(f)
 	}
 
 	var s string
@@ -230,7 +300,7 @@ func numberFrom(raw json.RawMessage) (float64, bool) {
 		if err != nil {
 			return 0, false
 		}
-		return finite(v), true
+		return finite(v)
 	}
 
 	var b bool
@@ -244,12 +314,14 @@ func numberFrom(raw json.RawMessage) (float64, bool) {
 	return 0, false
 }
 
-// finite replaces a NaN or an infinity with the fallback.
-func finite(v float64) float64 {
+// finite passes an ordinary number through and reports a NaN or an infinity
+// as no number at all. Without the guard, a reply of "Infinity" reaches
+// clamp01 and comes out as a perfectly confident 1.
+func finite(v float64) (float64, bool) {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return fallbackProbability
+		return 0, false
 	}
-	return v
+	return v, true
 }
 
 // clamp01 confines a probability to [0,1].

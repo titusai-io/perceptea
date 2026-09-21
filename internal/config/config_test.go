@@ -35,7 +35,8 @@ func TestLoadFromDefaults(t *testing.T) {
 		Addr:                    ":8080",
 		BaseURL:                 "https://api.deepinfra.com/v1/openai",
 		APIKey:                  "",
-		Model:                   "zai-org/GLM-5.3-Flash",
+		Model:                   "meta-llama/Meta-Llama-3.1-8B-Instruct",
+		ReasoningEffort:         "",
 		Temperature:             0,
 		MaxConcurrency:          8,
 		RequestTimeout:          60 * time.Second,
@@ -55,8 +56,37 @@ func TestLoadFromDefaults(t *testing.T) {
 	if DefaultInferenceBaseURL != "https://api.deepinfra.com/v1/openai" {
 		t.Errorf("DefaultInferenceBaseURL = %q", DefaultInferenceBaseURL)
 	}
-	if DefaultModel != "zai-org/GLM-5.3-Flash" {
+	if DefaultModel != "meta-llama/Meta-Llama-3.1-8B-Instruct" {
 		t.Errorf("DefaultModel = %q", DefaultModel)
+	}
+}
+
+// An unset reasoning effort is the whole of the default behaviour: the
+// provider is sent no reasoning field, exactly as it was before the setting
+// existed.
+func TestLoadFromReasoningEffort(t *testing.T) {
+	for _, tc := range []struct{ set, want string }{
+		{"", ""},
+		{"none", "none"},
+		{"low", "low"},
+		{"medium", "medium"},
+		{"high", "high"},
+		{"  high  ", "high"},
+		{"HIGH", "high"},
+	} {
+		name := tc.set
+		if name == "" {
+			name = "unset"
+		}
+		t.Run(name, func(t *testing.T) {
+			vars := map[string]string{}
+			if tc.set != "" {
+				vars["PERCEPTEA_REASONING_EFFORT"] = tc.set
+			}
+			if got := loadWith(t, vars).ReasoningEffort; got != tc.want {
+				t.Errorf("ReasoningEffort = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -76,6 +106,7 @@ func TestLoadFromEveryVariable(t *testing.T) {
 		"PERCEPTEA_INFERENCE_BASE_URL":        "https://example.test/v1",
 		"PERCEPTEA_API_KEY":                   "sk-from-perceptea",
 		"PERCEPTEA_MODEL":                     "some/model",
+		"PERCEPTEA_REASONING_EFFORT":          "medium",
 		"PERCEPTEA_TEMPERATURE":               "0.25",
 		"PERCEPTEA_MAX_CONCURRENCY":           "32",
 		"PERCEPTEA_REQUEST_TIMEOUT":           "90s",
@@ -90,6 +121,7 @@ func TestLoadFromEveryVariable(t *testing.T) {
 		BaseURL:                 "https://example.test/v1",
 		APIKey:                  "sk-from-perceptea",
 		Model:                   "some/model",
+		ReasoningEffort:         "medium",
 		Temperature:             0.25,
 		MaxConcurrency:          32,
 		RequestTimeout:          90 * time.Second,
@@ -184,18 +216,36 @@ func TestLoadFromErrors(t *testing.T) {
 		vars map[string]string
 		// wantVar must appear in the error message.
 		wantVar string
+		// wantIn must all appear in it too.
+		wantIn []string
 	}{
-		{"bad temperature", map[string]string{"PERCEPTEA_TEMPERATURE": "warm"}, "PERCEPTEA_TEMPERATURE"},
-		{"bad concurrency", map[string]string{"PERCEPTEA_MAX_CONCURRENCY": "lots"}, "PERCEPTEA_MAX_CONCURRENCY"},
-		{"zero concurrency", map[string]string{"PERCEPTEA_MAX_CONCURRENCY": "0"}, "PERCEPTEA_MAX_CONCURRENCY"},
-		{"bad timeout", map[string]string{"PERCEPTEA_REQUEST_TIMEOUT": "soon"}, "PERCEPTEA_REQUEST_TIMEOUT"},
-		{"bare number timeout", map[string]string{"PERCEPTEA_REQUEST_TIMEOUT": "60"}, "PERCEPTEA_REQUEST_TIMEOUT"},
-		{"negative timeout", map[string]string{"PERCEPTEA_REQUEST_TIMEOUT": "-5s"}, "PERCEPTEA_REQUEST_TIMEOUT"},
-		{"bad body limit", map[string]string{"PERCEPTEA_MAX_BODY_BYTES": "2mb"}, "PERCEPTEA_MAX_BODY_BYTES"},
-		{"zero body limit", map[string]string{"PERCEPTEA_MAX_BODY_BYTES": "0"}, "PERCEPTEA_MAX_BODY_BYTES"},
-		{"bad credentials flag", map[string]string{"PERCEPTEA_ALLOW_REQUEST_CREDENTIALS": "sure"}, "PERCEPTEA_ALLOW_REQUEST_CREDENTIALS"},
-		{"bad log level", map[string]string{"PERCEPTEA_LOG_LEVEL": "chatty"}, "PERCEPTEA_LOG_LEVEL"},
-		{"bad log format", map[string]string{"PERCEPTEA_LOG_FORMAT": "xml"}, "PERCEPTEA_LOG_FORMAT"},
+		{"bad temperature", map[string]string{"PERCEPTEA_TEMPERATURE": "warm"}, "PERCEPTEA_TEMPERATURE", nil},
+		{"bad concurrency", map[string]string{"PERCEPTEA_MAX_CONCURRENCY": "lots"}, "PERCEPTEA_MAX_CONCURRENCY", nil},
+		{"zero concurrency", map[string]string{"PERCEPTEA_MAX_CONCURRENCY": "0"}, "PERCEPTEA_MAX_CONCURRENCY", nil},
+		{"bad timeout", map[string]string{"PERCEPTEA_REQUEST_TIMEOUT": "soon"}, "PERCEPTEA_REQUEST_TIMEOUT", nil},
+		{"bare number timeout", map[string]string{"PERCEPTEA_REQUEST_TIMEOUT": "60"}, "PERCEPTEA_REQUEST_TIMEOUT", nil},
+		{"negative timeout", map[string]string{"PERCEPTEA_REQUEST_TIMEOUT": "-5s"}, "PERCEPTEA_REQUEST_TIMEOUT", nil},
+		{"bad body limit", map[string]string{"PERCEPTEA_MAX_BODY_BYTES": "2mb"}, "PERCEPTEA_MAX_BODY_BYTES", nil},
+		{"zero body limit", map[string]string{"PERCEPTEA_MAX_BODY_BYTES": "0"}, "PERCEPTEA_MAX_BODY_BYTES", nil},
+		{"bad credentials flag", map[string]string{"PERCEPTEA_ALLOW_REQUEST_CREDENTIALS": "sure"}, "PERCEPTEA_ALLOW_REQUEST_CREDENTIALS", nil},
+		{"bad log level", map[string]string{"PERCEPTEA_LOG_LEVEL": "chatty"}, "PERCEPTEA_LOG_LEVEL", nil},
+		{"bad log format", map[string]string{"PERCEPTEA_LOG_FORMAT": "xml"}, "PERCEPTEA_LOG_FORMAT", nil},
+		// A rejected effort has to list what would have been accepted:
+		// "thinking" and "off" are the plausible guesses, and neither is a
+		// value, so the message is the only place the operator can learn
+		// them.
+		{
+			"bad reasoning effort",
+			map[string]string{"PERCEPTEA_REASONING_EFFORT": "thinking"},
+			"PERCEPTEA_REASONING_EFFORT",
+			[]string{`"thinking"`, `"none"`, `"low"`, `"medium"`, `"high"`},
+		},
+		{
+			"an effort that is only nearly a value",
+			map[string]string{"PERCEPTEA_REASONING_EFFORT": "off"},
+			"PERCEPTEA_REASONING_EFFORT",
+			[]string{`"none"`},
+		},
 	}
 
 	for _, tt := range tests {
@@ -206,6 +256,11 @@ func TestLoadFromErrors(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.wantVar) {
 				t.Errorf("error %q does not name %s", err, tt.wantVar)
+			}
+			for _, want := range tt.wantIn {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %s", err, want)
+				}
 			}
 			if !reflect.DeepEqual(cfg, Config{}) {
 				t.Errorf("a failed load returned a non-zero config: %+v", cfg)

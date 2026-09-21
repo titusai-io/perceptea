@@ -3,13 +3,16 @@ package inference
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/titusai-io/perceptea/classifier"
+	"github.com/titusai-io/perceptea/internal/config"
 )
 
 // wantSystemPrompt is the system turn written out independently of the
@@ -526,8 +529,266 @@ func TestScoreHandlesAnEmptyChoicesArray(t *testing.T) {
 	}
 }
 
+// A scoring call caps the reply at 32 tokens, which is room enough for
+// {"p":0.87} and none at all for a model that thinks first. Spent on thinking
+// tokens, the budget runs out before the JSON — and because the cap is the
+// same on every call, every candidate of the request comes back unreadable,
+// every score is the 0.5 fallback, and the softmax renders a uniform set of
+// scores as a confident-looking answer carrying no information. Failing the
+// call is the only way that does not look like a result.
+func TestScoreRejectsATruncatedReplyWithNoProbability(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply replyFixture
+	}{
+		{
+			"nothing but thinking, in the reasoning field",
+			replyFixture{reasoning: thinkingOutLoud, finishReason: "length"},
+		},
+		{
+			"nothing but thinking, under the other field name",
+			replyFixture{reasoningContent: thinkingOutLoud, finishReason: "length"},
+		},
+		{
+			"prose cut off before any number",
+			replyFixture{content: "Based on the state provided, I would estimate the probability to be", finishReason: "length"},
+		},
+		{
+			"the JSON cut off before the value",
+			replyFixture{content: `{"p":`, finishReason: "length"},
+		},
+		{
+			"an empty reply with nothing anywhere",
+			replyFixture{finishReason: "length"},
+		},
+		{
+			"a finish reason the provider shouted",
+			replyFixture{reasoning: thinkingOutLoud, finishReason: "LENGTH"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := alwaysJSON(t, tc.reply.body())
+			client, _ := newTestClient(t, api, nil)
+
+			got, err := client.Score(context.Background(), fixtureRequest)
+			if err == nil {
+				t.Fatalf("Score returned %v and no error; a truncated reply must not be scored as a probability", got)
+			}
+			if !errors.Is(err, ErrTruncatedReply) {
+				t.Fatalf("Score returned %v, want ErrTruncatedReply", err)
+			}
+			if got.Probability == fallbackProbability {
+				t.Error("the fallback probability came back alongside the error")
+			}
+
+			// The message is what an operator gets in a 502, so it has to
+			// carry the finding, the cause and both ways out.
+			msg := err.Error()
+			for _, want := range []string{
+				"cut off", "output token limit", "32", "thinking tokens",
+				"does not reason", "PERCEPTEA_REASONING_EFFORT", `"none"`,
+			} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the error does not mention %q: %s", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// The truncation message names a setting, and a message that names the wrong
+// setting is worse than one that names none: it sends the operator to an
+// environment variable nothing reads. This package spells the name out rather
+// than importing the server's configuration, because a provider client is
+// usable on its own; this is the guard that keeps the two in step.
+func TestTheTruncationMessageNamesTheSettingTheServerActuallyReads(t *testing.T) {
+	if envReasoningEffort != config.EnvReasoningEffort {
+		t.Errorf("the error points at %q; the server reads %q", envReasoningEffort, config.EnvReasoningEffort)
+	}
+	if effortNone != config.EffortNone {
+		t.Errorf("the error suggests %q; the server accepts %q", effortNone, config.EffortNone)
+	}
+}
+
+// An empty content field beside a populated reasoning field is the signature
+// of this failure and nothing else, so the message says so outright rather
+// than leaving the reader to guess which of the two causes they have.
+func TestATruncatedReplyNamesTheEmptyContentBesideTheReasoning(t *testing.T) {
+	api := alwaysJSON(t, replyFixture{reasoning: thinkingOutLoud, finishReason: "length"}.body())
+	client, _ := newTestClient(t, api, nil)
+
+	_, err := client.Score(context.Background(), fixtureRequest)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	for _, want := range []string{"content was empty", "reasoning field"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %q: %s", want, err)
+		}
+	}
+
+	// And it is not claimed of a reply that was simply cut short mid-answer:
+	// there the cap is still the fault, but the reasoning field is not the
+	// evidence for it.
+	api = alwaysJSON(t, replyFixture{content: "I would estimate the probability to be", finishReason: "length"}.body())
+	client, _ = newTestClient(t, api, nil)
+
+	_, err = client.Score(context.Background(), fixtureRequest)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if strings.Contains(err.Error(), "content was empty") {
+		t.Errorf("a reply that did have content is described as having none: %s", err)
+	}
+}
+
+// The rule is about a truncated reply that said nothing, not about
+// truncation. A reply that got its number out before the cap stopped it
+// answered the question.
+func TestScoreAcceptsATruncatedReplyThatStillCarriedAProbability(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply replyFixture
+		want  float64
+	}{
+		{"the JSON landed, the closing prose did not", replyFixture{content: `{"p":0.87}`, finishReason: "length"}, 0.87},
+		{"a number in prose, then the cap", replyFixture{content: "I would say 0.42 based on", finishReason: "length"}, 0.42},
+		{"the answer came out of the reasoning field", replyFixture{reasoning: `{"p":0.31}`, finishReason: "length"}, 0.31},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := alwaysJSON(t, tc.reply.body())
+			client, _ := newTestClient(t, api, nil)
+
+			got, err := client.Score(context.Background(), fixtureRequest)
+			if err != nil {
+				t.Fatalf("Score: %v, want the probability the reply did carry", err)
+			}
+			if math.Abs(got.Probability-tc.want) > 1e-9 {
+				t.Errorf("probability = %v, want %v", got.Probability, tc.want)
+			}
+		})
+	}
+}
+
+// Everywhere else the forgiveness stands. A reply that finished normally and
+// still said nothing readable is a one-off: one candidate, one blunted score,
+// no error. Making the parser stricter than the truncation case would fail a
+// whole evaluation over one model's odd sentence.
+func TestScoreStillForgivesAnUnreadableReplyThatFinishedNormally(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply replyFixture
+	}{
+		{"stopped normally with no number", replyFixture{content: "It is impossible to tell from the state.", finishReason: "stop"}},
+		{"stopped normally with nothing at all", replyFixture{finishReason: "stop"}},
+		{"no finish reason reported", replyFixture{content: "It is impossible to tell from the state."}},
+		{"stopped by a content filter", replyFixture{finishReason: "content_filter"}},
+		{"stopped for a tool call", replyFixture{finishReason: "tool_calls"}},
+		{"a JSON document with no probability in it", replyFixture{content: `{"answer":"yes"}`, finishReason: "stop"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := alwaysJSON(t, tc.reply.body())
+			client, _ := newTestClient(t, api, nil)
+
+			got, err := client.Score(context.Background(), fixtureRequest)
+			if err != nil {
+				t.Fatalf("Score: %v, want the 0.5 fallback rather than an error", err)
+			}
+			if got.Probability != fallbackProbability {
+				t.Errorf("probability = %v, want %v", got.Probability, fallbackProbability)
+			}
+		})
+	}
+}
+
+// An empty choices list has no finish reason to read, so it keeps the
+// fallback it always had.
+func TestScoreForgivesAnEmptyChoicesListWhateverElseIsInTheDocument(t *testing.T) {
+	api := alwaysJSON(t, `{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":32}}`)
+	client, _ := newTestClient(t, api, nil)
+
+	got, err := client.Score(context.Background(), fixtureRequest)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.Probability != fallbackProbability {
+		t.Errorf("probability = %v, want %v", got.Probability, fallbackProbability)
+	}
+}
+
+// Unset is the default, and the default is the behaviour this client had
+// before the setting existed: no reasoning field on the wire at all, so an
+// endpoint that has never seen one is sent exactly what it was sent before.
+func TestScoreSendsNoReasoningEffortUnlessOneIsConfigured(t *testing.T) {
+	for _, configured := range []string{"", "   "} {
+		api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+		client, _ := newTestClient(t, api, func(cfg *Config) { cfg.ReasoningEffort = configured })
+
+		if _, err := client.Score(context.Background(), fixtureRequest); err != nil {
+			t.Fatalf("Score: %v", err)
+		}
+		if _, present := api.request(t, 0).body(t)["reasoning_effort"]; present {
+			t.Errorf("reasoning_effort was sent although none is configured (%q)", configured)
+		}
+	}
+}
+
+func TestScoreSendsTheConfiguredReasoningEffort(t *testing.T) {
+	for _, effort := range []string{"none", "low", "medium", "high"} {
+		t.Run(effort, func(t *testing.T) {
+			api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+			client, _ := newTestClient(t, api, func(cfg *Config) { cfg.ReasoningEffort = effort })
+
+			if _, err := client.Score(context.Background(), fixtureRequest); err != nil {
+				t.Fatalf("Score: %v", err)
+			}
+			if got := api.request(t, 0).body(t)["reasoning_effort"]; got != effort {
+				t.Errorf("reasoning_effort = %v, want %q", got, effort)
+			}
+		})
+	}
+}
+
+// The effort survives the structured-output negotiation: a client that
+// discovers json_schema is unsupported must not drop the one field that keeps
+// the reply short enough to read.
+func TestTheReasoningEffortSurvivesADowngrade(t *testing.T) {
+	api := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, n int) {
+		if n == 0 {
+			writeJSON(w, http.StatusBadRequest, `{"error":{"message":"json_schema unsupported"}}`)
+			return
+		}
+		writeJSON(w, http.StatusOK, scoreBody(`{"p":0.5}`))
+	})
+	client, _ := newTestClient(t, api, func(cfg *Config) { cfg.ReasoningEffort = "none" })
+
+	if _, err := client.Score(context.Background(), fixtureRequest); err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if api.count() != 2 {
+		t.Fatalf("made %d calls, want 2", api.count())
+	}
+	if got := api.request(t, 1).body(t)["reasoning_effort"]; got != "none" {
+		t.Errorf("the downgraded call sent reasoning_effort %v, want %q", got, "none")
+	}
+}
+
 func TestScoreFallsBackToTheReasoningField(t *testing.T) {
 	api := alwaysJSON(t, `{"choices":[{"message":{"content":null,"reasoning":"weighing it up, p = 0.66"}}]}`)
+	client, _ := newTestClient(t, api, nil)
+
+	got, err := client.Score(context.Background(), fixtureRequest)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if math.Abs(got.Probability-0.66) > 1e-9 {
+		t.Errorf("probability = %v, want 0.66", got.Probability)
+	}
+}
+
+// The other name the same field goes by.
+func TestScoreFallsBackToTheReasoningContentField(t *testing.T) {
+	api := alwaysJSON(t, replyFixture{reasoningContent: "weighing it up, p = 0.66", finishReason: "stop"}.body())
 	client, _ := newTestClient(t, api, nil)
 
 	got, err := client.Score(context.Background(), fixtureRequest)

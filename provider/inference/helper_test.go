@@ -126,6 +126,51 @@ func scoreBody(content string) string {
 	return `{"choices":[{"message":{"role":"assistant","content":` + string(raw) + `}}]}`
 }
 
+// replyFixture is one completion as a provider would send it, assembled field
+// by field so that a test can stage a reply with no content, a populated
+// reasoning field, or a finish reason — the three things a truncated answer is
+// made of. A blank field is omitted, except content, which is sent as null
+// the way a thinking model's reply arrives.
+type replyFixture struct {
+	content          string
+	reasoning        string
+	reasoningContent string
+	finishReason     string
+	promptTokens     int
+	completionTokens int
+}
+
+// body renders the fixture as a response document.
+func (f replyFixture) body() string {
+	message := map[string]any{"role": "assistant", "content": nil}
+	if f.content != "" {
+		message["content"] = f.content
+	}
+	if f.reasoning != "" {
+		message["reasoning"] = f.reasoning
+	}
+	if f.reasoningContent != "" {
+		message["reasoning_content"] = f.reasoningContent
+	}
+	choice := map[string]any{"message": message}
+	if f.finishReason != "" {
+		choice["finish_reason"] = f.finishReason
+	}
+	document := map[string]any{"choices": []any{choice}}
+	if f.promptTokens != 0 || f.completionTokens != 0 {
+		document["usage"] = map[string]any{
+			"prompt_tokens":     f.promptTokens,
+			"completion_tokens": f.completionTokens,
+		}
+	}
+	raw, _ := json.Marshal(document)
+	return string(raw)
+}
+
+// thinkingOutLoud is what a reasoning model has produced by the time a small
+// output cap stops it: the beginning of its deliberation, and no answer.
+const thinkingOutLoud = "Okay, let me think about this. The state says the sky is grey, which often precedes rain, but grey skies also"
+
 // sleepLog records the backoffs a client asked for instead of serving them.
 type sleepLog struct {
 	mu    sync.Mutex

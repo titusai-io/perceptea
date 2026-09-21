@@ -64,6 +64,14 @@ type Config struct {
 	BaseURL string
 	// Model is used for any request that does not name a model of its own.
 	Model string
+	// ReasoningEffort is sent as reasoning_effort on every call. Empty — the
+	// default — sends no reasoning field at all, which is what a provider
+	// that has never heard of one expects. The usual values are "none",
+	// "low", "medium" and "high"; the value is passed through rather than
+	// checked here, because which of them an endpoint honours is the
+	// endpoint's business and an operator's typo belongs to whoever reads
+	// the configuration.
+	ReasoningEffort string
 	// HTTPClient overrides the transport. The default client has sane
 	// timeouts and enough idle connections per host for a fanned-out
 	// evaluation.
@@ -86,14 +94,15 @@ type Config struct {
 // Client calls one OpenAI-compatible chat completions endpoint. Create one with
 // [New]; the zero value is not usable. It is safe for concurrent use.
 type Client struct {
-	apiKey     string
-	baseURL    string
-	model      string
-	httpClient *http.Client
-	maxRetries int
-	referer    string
-	title      string
-	log        *slog.Logger
+	apiKey          string
+	baseURL         string
+	model           string
+	reasoningEffort string
+	httpClient      *http.Client
+	maxRetries      int
+	referer         string
+	title           string
+	log             *slog.Logger
 
 	// level is the structured-output level currently believed to work,
 	// shared by every in-flight call so that a provider that rejects
@@ -148,15 +157,16 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		apiKey:     key,
-		baseURL:    base,
-		model:      strings.TrimSpace(cfg.Model),
-		httpClient: httpClient,
-		maxRetries: retries,
-		referer:    cfg.Referer,
-		title:      cfg.Title,
-		log:        logger,
-		sleep:      sleepContext,
+		apiKey:          key,
+		baseURL:         base,
+		model:           strings.TrimSpace(cfg.Model),
+		reasoningEffort: strings.TrimSpace(cfg.ReasoningEffort),
+		httpClient:      httpClient,
+		maxRetries:      retries,
+		referer:         cfg.Referer,
+		title:           cfg.Title,
+		log:             logger,
+		sleep:           sleepContext,
 	}, nil
 }
 

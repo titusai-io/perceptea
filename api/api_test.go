@@ -401,6 +401,42 @@ func TestEvaluateSettingsCarryTheConfiguredLimits(t *testing.T) {
 	}
 }
 
+func TestEvaluateSettingsCarryTheConfiguredReasoningEffort(t *testing.T) {
+	for _, effort := range []string{"", config.EffortNone, config.EffortHigh} {
+		name := effort
+		if name == "" {
+			name = "unset"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, func(c *config.Config) { c.ReasoningEffort = effort })
+			if w := h.post(validBody); w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+			}
+			if got := h.settings().ReasoningEffort; got != effort {
+				t.Errorf("Settings.ReasoningEffort = %q, want %q", got, effort)
+			}
+		})
+	}
+}
+
+// The reasoning effort is a property of the model the operator chose, not of
+// the question being asked, so it is server-side only. A body that tries to
+// name one is rejected like any other unknown field rather than quietly
+// ignored — silently dropping it would read as support.
+func TestEvaluateRejectsAReasoningEffortInTheBody(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.ReasoningEffort = config.EffortNone })
+
+	message := h.expectError(
+		h.post(`{"state":"s","questions":{"q":{"type":"noul"}},"reasoning_effort":"high"}`),
+		http.StatusBadRequest, codeInvalidJSON)
+	if !strings.Contains(message, "reasoning_effort") {
+		t.Errorf("message = %q, want it to name the field it rejected", message)
+	}
+	if len(h.seenSettings) != 0 {
+		t.Error("a rejected request still reached the evaluator")
+	}
+}
+
 func TestEvaluateRejectsAWrongMethod(t *testing.T) {
 	h := newHarness(t, nil)
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {

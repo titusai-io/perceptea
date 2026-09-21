@@ -122,10 +122,14 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	evaluator, err := s.newEvaluator(Settings{
-		APIKey:         apiKey,
-		BaseURL:        baseURL,
-		Model:          model,
-		MaxConcurrency: s.cfg.MaxConcurrency,
+		APIKey:  apiKey,
+		BaseURL: baseURL,
+		Model:   model,
+		// Server-side only, deliberately: the reasoning effort describes
+		// the model the operator chose, and letting a caller raise it
+		// would let them spend the server's key on thinking tokens.
+		ReasoningEffort: s.cfg.ReasoningEffort,
+		MaxConcurrency:  s.cfg.MaxConcurrency,
 	})
 	if err != nil {
 		s.fail(w, r, err)

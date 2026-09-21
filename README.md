@@ -61,7 +61,8 @@ go run ./cmd/perceptea
 
 ```
 time=2026-09-20T21:12:58.122-04:00 level=INFO msg="perceptea listening" addr=[::]:8080
-  inference_base_url=https://api.deepinfra.com/v1/openai model=zai-org/GLM-5.3-Flash
+  inference_base_url=https://api.deepinfra.com/v1/openai
+  model=meta-llama/Meta-Llama-3.1-8B-Instruct
   api_key_configured=true allow_request_credentials=true request_timeout=1m0s
   max_concurrency=8
 ```
@@ -79,7 +80,7 @@ a model that endpoint serves:
 
 ```bash
 PERCEPTEA_INFERENCE_BASE_URL=https://openrouter.ai/api/v1 \
-  PERCEPTEA_MODEL=z-ai/glm-5.3-flash \
+  PERCEPTEA_MODEL=meta-llama/llama-3.1-8b-instruct \
   PERCEPTEA_API_KEY=sk-or-... go run ./cmd/perceptea
 
 PERCEPTEA_INFERENCE_BASE_URL=http://localhost:11434/v1 \
@@ -105,7 +106,8 @@ comes up and rejects the requests that would need one with a 401.
 | `PERCEPTEA_ADDR` | `:8080` | Listen address. `-addr` overrides it. |
 | `PERCEPTEA_INFERENCE_BASE_URL` | `https://api.deepinfra.com/v1/openai` | The API root of the service that runs the model — see below. Must be an absolute `http` or `https` URL. A credential in it — userinfo, or a `?key=` — never reaches a response or a log line. |
 | `PERCEPTEA_API_KEY` | — | The key sent to that endpoint as a bearer token. The only variable a key is read from. |
-| `PERCEPTEA_MODEL` | `zai-org/GLM-5.3-Flash` | The model id to score with. It has to be one the endpoint above serves. |
+| `PERCEPTEA_MODEL` | `meta-llama/Meta-Llama-3.1-8B-Instruct` | The model id to score with. It has to be one the endpoint above serves, and it should be one that does not reason — see [Choosing a model](#choosing-a-model). |
+| `PERCEPTEA_REASONING_EFFORT` | — | Sent to the provider as `reasoning_effort`: `none`, `low`, `medium` or `high`. Unset sends no reasoning field at all. See [Choosing a model](#choosing-a-model). |
 | `PERCEPTEA_TEMPERATURE` | `0` | Sampling temperature. 0 is the only reproducible setting. |
 | `PERCEPTEA_MAX_CONCURRENCY` | `8` | Scoring calls in flight per evaluation. |
 | `PERCEPTEA_REQUEST_TIMEOUT` | `60s` | Deadline for one request, end to end. |
@@ -143,16 +145,17 @@ else that speaks the same chat completions API.
 
 | Where the model runs | `PERCEPTEA_INFERENCE_BASE_URL` | An id for `PERCEPTEA_MODEL` |
 |---|---|---|
-| DeepInfra | `https://api.deepinfra.com/v1/openai` | `zai-org/GLM-5.3-Flash` |
-| OpenRouter | `https://openrouter.ai/api/v1` | `z-ai/glm-5.3-flash` |
-| Z.ai | `https://api.z.ai/api/paas/v4` | `glm-5.3-flash` |
+| DeepInfra | `https://api.deepinfra.com/v1/openai` | `meta-llama/Meta-Llama-3.1-8B-Instruct` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `meta-llama/llama-3.1-8b-instruct` |
+| Z.ai | `https://api.z.ai/api/paas/v4` | `glm-5.3-flash` (a reasoning model — read the next section first) |
 | Ollama, locally | `http://localhost:11434/v1` | whatever you have pulled, e.g. `llama3.1` |
 | vLLM, locally | `http://localhost:8000/v1` | the id the server was started with |
 
-The same model is published under a different id by each of them, which is
-why the model is a setting of its own and not something derived from the
-endpoint. A hosted endpoint wants its own key in `PERCEPTEA_API_KEY`; a local
-one usually wants a throwaway string rather than nothing at all.
+One model is published under a different id by each of them — the first two
+rows are the same weights — which is why the model is a setting of its own
+and not something derived from the endpoint. A hosted endpoint wants its own
+key in `PERCEPTEA_API_KEY`; a local one usually wants a throwaway string
+rather than nothing at all.
 
 ### Timeouts that are not configurable
 
@@ -166,6 +169,149 @@ the first of them is visible to callers:
 | write | request timeout + 30s | The response, with room for a whole evaluation before it. |
 | idle | 120s | A kept-alive connection between requests. |
 | shutdown grace | request timeout + 5s, at least 30s | How long a `SIGTERM` waits for requests in flight. Never shorter than a request is allowed to be. |
+
+## Choosing a model
+
+Most services pick a model by capability. This one should not, because the
+shape of the work is unusual and that shape decides almost everything.
+
+### What this workload actually looks like
+
+**One call per declared candidate answer.** A request with a choice of 4, a
+score of 4 and a noul is **9 calls**, not one. Every one of them re-sends the
+whole state, and every one of them asks for the same ten characters back:
+
+```
+9 calls × (system prompt + state + one statement)   ← the bill
+9 × {"p": 0.87}                                     ← the output
+```
+
+So **input tokens dominate and output is about ten tokens per call.** A
+provider's output price, the number most model comparisons lead with, is
+nearly irrelevant here. Input price and latency are what you are buying, and
+latency matters twice over because the calls fan out: the request takes as
+long as the slowest wave of `PERCEPTEA_MAX_CONCURRENCY` calls, not as long as
+one.
+
+### Reasoning models are the trap
+
+A scoring call sets `max_tokens: 32`. That is room for `{"p": 0.87}` and
+nothing else, and it is deliberate: it is what stops a chatty model turning
+one score into an essay.
+
+A model that thinks before it answers spends that budget on thinking tokens.
+The reply is cut off before the JSON, and because the cap is the same on
+every call, **it happens to every candidate in the request at once.**
+
+Unguarded, that is the worst failure a classifier can have. An unreadable
+reply degrades to the neutral 0.5, so every candidate scores 0.5, the softmax
+turns nine identical scores into a flat distribution, and the service answers
+200 with a well-formed, confident-looking document that is pure noise — and
+nothing in the log says otherwise.
+
+So it is guarded: a reply cut off before it said anything readable is a
+**502 `upstream_error`** whose message says the reply was cut off at the
+output token limit, that this is what a reasoning model does under a small
+limit, and what to change. A reply that did get its number out before the cap
+is still accepted, and a reply that finished normally and said nothing
+readable is still the one-off it always was, worth one 0.5 and no more.
+
+**How to check before you point at one.** DeepInfra tags its models, and the
+tags are on the model list and on each model's page. The three that matter:
+
+- `non-reasoning` — safe, pick one of these.
+- `can-disable-reasoning` — usable with `PERCEPTEA_REASONING_EFFORT=none`.
+- `reasoning` with no `can-disable-reasoning` — the trap. It will be
+  truncated on every scoring call, and there is nothing this service can send
+  to stop it.
+
+Other providers publish the same thing under other names; if you cannot find
+out, send one request and see whether you get a 502.
+
+### What matters, in order
+
+1. **Does it reason?** A yes is disqualifying unless the thinking can be
+   turned off. Everything else is a preference; this one is a constraint.
+2. **Does it support a JSON-schema response format?** The scorer asks for a
+   strict `json_schema` first, steps down to `json_object`, then to plain
+   text, and salvages a number out of prose if it has to. All three paths
+   work — the negotiation is remembered per client, so it costs one probe —
+   but the strict path is the one where the reply cannot be anything but a
+   probability. DeepInfra tags these `structured-output`.
+3. **Input price.** Nine calls of a few hundred tokens each, per request.
+4. **Latency.** Small models answer in a fraction of the time a large one
+   takes, and the fan-out multiplies the difference.
+5. **General capability, last.** Each call asks one question: how likely is
+   this one statement, given this one state. That is a judgement, not a
+   reasoning task — there is no chain to follow and no document to keep
+   coherent, which is the whole point of the parallel sampler. A small
+   instruction-tuned model does this well.
+
+### Good choices on DeepInfra
+
+Prices are US dollars per million tokens, from DeepInfra's own model list.
+Remember the shape of the bill: the input column is the one you are paying.
+
+| Model | In $/M | Out $/M | Notes |
+|---|---|---|---|
+| **`meta-llama/Meta-Llama-3.1-8B-Instruct`** | **0.020** | **0.050** | **The default.** Non-reasoning, structured output, tools. Cheapest input of the set and fast. |
+| `mistralai/Mistral-Nemo-Instruct-2407` | 0.019 | 0.030 | Non-reasoning, structured output, tools. Marginally cheaper still; a fine swap. |
+| `mistralai/Mistral-Small-24B-Instruct-2501` | 0.050 | 0.080 | Non-reasoning, structured output. Step up in judgement for 2.5× the input price. |
+| `google/gemma-3-27b-it` | 0.080 | 0.160 | Non-reasoning, structured output, tools. The most capable non-reasoning option here. |
+| `Qwen/Qwen3-32B` | 0.080 | 0.280 | Has a thinking switch — set `PERCEPTEA_REASONING_EFFORT=none`. |
+| `deepseek-ai/DeepSeek-V4-Flash` | 0.090 | 0.180 | `can-disable-reasoning`; same, set the effort to `none`. |
+| `zai-org/GLM-5.3-Flash` | 0.150 | 0.500 | **Reasoning, and it cannot be disabled.** Every scoring reply is truncated at 32 tokens. Not usable for `parallel` mode as it stands. |
+
+Tags and prices move; check the list rather than this table when it matters.
+
+### What it costs
+
+Take a 300-token state and the 9-candidate request above. Each call carries
+the system prompt, the state and one statement — call it 300 tokens — so the
+request is roughly **2,700 input tokens and 90 output tokens**.
+
+At the default model's prices that is 2,700 × $0.020/M + 90 × $0.050/M ≈
+**$0.00006**, six thousandths of a cent. A thousand requests is six cents.
+Even the most expensive row above lands under a twentieth of a cent per
+request.
+
+So cost is rarely the thing to optimise. **Reliability is**: a model that
+returns a readable probability every time is worth far more than one that
+saves you a hundredth of a cent and truncates.
+
+### `PERCEPTEA_REASONING_EFFORT`
+
+```bash
+PERCEPTEA_REASONING_EFFORT=none go run ./cmd/perceptea
+```
+
+Unset — the default — sends **no reasoning field at all**, which is exactly
+what a provider that has never seen one expects. Set to `none`, `low`,
+`medium` or `high`, it is sent as `reasoning_effort` in every scoring and
+generate request body — the name the OpenAI-compatible protocol settled on,
+and the one DeepInfra accepts. Anything else stops the process at startup,
+naming the variable and listing the four values.
+
+It is server-side only: a request body cannot carry one, because the effort
+describes the model the operator chose rather than the question being asked.
+
+`chat_template_kwargs: {"enable_thinking": false}` is a second, widely
+implemented way to ask for the same thing, and **this service does not send
+it.** It is provider-specific where `reasoning_effort` is not, and an
+endpoint that validates its request bodies strictly answers an unknown field
+with a 400 — which would break every request against a provider that has
+never heard of it, to help with one that has. If your model only understands
+that switch, set it where the model is served, or use one that does not need
+it.
+
+### One honest caveat
+
+None of these models is calibrated for this task. A reply of `0.87` means the
+model was willing to write 0.87; it is not a frequency, and nothing here has
+been fitted to outcomes. **Compare the probabilities across the candidates of
+one question, not across states or across models.** A distribution of
+`0.71 / 0.12 / 0.17` says the first option was preferred by roughly that much
+on this state, and that is all it says.
 
 ## API
 
@@ -197,13 +343,13 @@ curl -s localhost:8080/api/evaluate \
         "instructions": "Strong frustration or anger?"
       }
     },
-    "model": "zai-org/GLM-5.3-Flash"
+    "model": "meta-llama/Meta-Llama-3.1-8B-Instruct"
   }' | jq
 ```
 
 ```json
 {
-  "model": "zai-org/GLM-5.3-Flash",
+  "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
   "answers": {
     "department": {
       "type": "choice",
@@ -260,7 +406,7 @@ curl -s localhost:8080/api/health
 ```
 
 ```json
-{"ok":true,"service":"perceptea","inference_base_url":"https://api.deepinfra.com/v1/openai","model":"zai-org/GLM-5.3-Flash","api_key_configured":true}
+{"ok":true,"service":"perceptea","inference_base_url":"https://api.deepinfra.com/v1/openai","model":"meta-llama/Meta-Llama-3.1-8B-Instruct","api_key_configured":true}
 ```
 
 It reports what this process would call: the endpoint, the model, and whether
@@ -291,7 +437,7 @@ Every failure but one answers with the same body, so a client can branch on
 | 429 | `upstream_rate_limited` | The provider rate limited us. Reported even when the wait for it ran into the request deadline. |
 | 499 | — | The caller hung up, or the body stopped arriving. No body is sent. |
 | 500 | `internal` | A bug, a panic included. The detail goes to the log, not to the caller. |
-| 502 | `upstream_error` | The provider failed, or could not be reached. |
+| 502 | `upstream_error` | The provider failed, could not be reached, or cut its reply off at the output token limit before saying anything readable — see [Choosing a model](#choosing-a-model). The message says which. |
 | 504 | `timeout` | The evaluation outran `PERCEPTEA_REQUEST_TIMEOUT`, or the body did not arrive before the read timeout. |
 
 A failure that is about the connection rather than the document — a body that
@@ -361,7 +507,7 @@ func main() {
 	client, err := inference.New(inference.Config{
 		APIKey:  os.Getenv("PERCEPTEA_API_KEY"),
 		BaseURL: "https://api.deepinfra.com/v1/openai",
-		Model:   "zai-org/GLM-5.3-Flash",
+		Model:   "meta-llama/Meta-Llama-3.1-8B-Instruct",
 	})
 	if err != nil {
 		panic(err)
@@ -385,7 +531,7 @@ func main() {
 		Evaluate(context.Background(), classifier.Request{
 			State:     classifier.StringState("Charged twice again!! Second month in a row."),
 			Questions: *questions,
-			Model:     "zai-org/GLM-5.3-Flash",
+			Model:     "meta-llama/Meta-Llama-3.1-8B-Instruct",
 		})
 	if err != nil {
 		panic(err)
@@ -447,4 +593,9 @@ zero-dependency claim at the top of this file is checked rather than trusted),
   ordinary chat models used as micro-scorers; its latency and calibration are
   those of the model you point it at, and one call per candidate is a worse
   deal than a model that scores the whole answer space in a single pass.
+- **A reasoning model cannot be used for `parallel` mode** unless its
+  thinking can be turned off, because a scoring reply is capped at 32 tokens
+  and thinking tokens exhaust it before the answer. The request fails with a
+  502 that says so, which is the best available outcome, not a good one. See
+  [Choosing a model](#choosing-a-model).
 - **`oneshot` is a comparison baseline**, not a supported path. Use `parallel`.

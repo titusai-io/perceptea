@@ -42,6 +42,10 @@ type Settings struct {
 	BaseURL string
 	// Model is the resolved model id.
 	Model string
+	// ReasoningEffort is the reasoning_effort the provider client sends on
+	// every call, or empty to send none. It comes from the server's
+	// configuration and from nowhere else: a request body cannot name one.
+	ReasoningEffort string
 	// MaxConcurrency bounds the scoring calls one evaluation runs at once.
 	MaxConcurrency int
 }

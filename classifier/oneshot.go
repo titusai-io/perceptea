@@ -109,6 +109,11 @@ func (e *Evaluator) evaluateOneshot(ctx context.Context, req Request, state stri
 
 	parsed, err := parseOneshotContent(result.Content)
 	if err != nil {
+		if truncatedFinish(result.FinishReason) {
+			return evaluation{}, fmt.Errorf("%w; raise the provider's output token limit, "+
+				"or use a model that does not spend it on thinking tokens: %s",
+				ErrTruncatedReply, snippet(result.Content))
+		}
 		return evaluation{}, err
 	}
 
@@ -152,6 +157,14 @@ func parseOneshotContent(content string) (map[string]json.RawMessage, error) {
 		return map[string]json.RawMessage{}, nil
 	}
 	return parsed, nil
+}
+
+// truncatedFinish reports whether a provider's finish reason says the reply
+// ran out of output tokens rather than ending. The comparison is
+// case-insensitive: the value is text a provider echoes, not a constant this
+// package defines.
+func truncatedFinish(reason string) bool {
+	return strings.EqualFold(strings.TrimSpace(reason), "length")
 }
 
 // snippet trims a reply down to something quotable in an error. The cut is at

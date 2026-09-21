@@ -21,6 +21,13 @@ var (
 	// ErrUnknownMode is returned when a request names a mode that is neither
 	// [ModeParallel] nor [ModeOneshot].
 	ErrUnknownMode = errors.New("classifier: unknown mode")
+
+	// ErrTruncatedReply is returned for [ModeOneshot] when the provider cut
+	// the answer document off at an output token limit. A document that
+	// stops mid-way is not a model that answered badly, and reporting it as
+	// unreadable JSON sends whoever reads the message looking for the wrong
+	// fault.
+	ErrTruncatedReply = errors.New("classifier: the one-shot reply was cut off at the output token limit before the answer document was complete")
 )
 
 // Limits on what a question may declare. They follow the published contract

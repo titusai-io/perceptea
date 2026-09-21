@@ -4,8 +4,8 @@
 # any request. Everything below is a real, runnable example of the three
 # question types.
 #
-# Start the service first. DeepInfra and zai-org/GLM-5.3-Flash are already the
-# defaults, so a key is the only thing it needs:
+# Start the service first. DeepInfra and meta-llama/Meta-Llama-3.1-8B-Instruct
+# are already the defaults, so a key is the only thing it needs:
 #
 #     PERCEPTEA_API_KEY=<your DeepInfra key> go run ./cmd/perceptea
 #
@@ -270,12 +270,32 @@ Content-Type: application/json
 ###############################################################################
 
 ### Override the model for one request
+# Any model the endpoint serves, as long as it does not reason: a scoring
+# reply is capped at 32 tokens, and a thinking model spends them all before
+# it writes the JSON. That comes back as a 502 saying so. See "Choosing a
+# model" in the README for the candidates and their prices.
 POST {{host}}/api/evaluate
 Content-Type: application/json
 
 {
   "state": "The checkout page 500s when the cart is empty.",
-  "model": "zai-org/GLM-5.3",
+  "model": "mistralai/Mistral-Nemo-Instruct-2407",
+  "questions": {
+    "is_bug": { "type": "noul", "instructions": "This describes a software defect" }
+  }
+}
+
+### What a reasoning model does to this service
+# zai-org/GLM-5.3-Flash is tagged reasoning on DeepInfra with no way to turn
+# the thinking off, so the 32-token scoring reply never reaches the JSON.
+# Send this to see the failure: a 502 upstream_error explaining that the
+# reply was cut off, instead of the uniform distribution it used to return.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "The checkout page 500s when the cart is empty.",
+  "model": "zai-org/GLM-5.3-Flash",
   "questions": {
     "is_bug": { "type": "noul", "instructions": "This describes a software defect" }
   }
@@ -314,7 +334,7 @@ Content-Type: application/json
   "state": "Charged twice again!!",
   "inference_base_url": "https://api.deepinfra.com/v1/openai",
   "api_key": "{{$dotenv PERCEPTEA_API_KEY}}",
-  "model": "zai-org/GLM-5.3-Flash",
+  "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
   "questions": {
     "angry": { "type": "noul", "instructions": "The customer is angry" }
   }

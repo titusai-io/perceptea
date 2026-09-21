@@ -20,6 +20,7 @@ const (
 	EnvInferenceBaseURL        = "PERCEPTEA_INFERENCE_BASE_URL"
 	EnvAPIKey                  = "PERCEPTEA_API_KEY"
 	EnvModel                   = "PERCEPTEA_MODEL"
+	EnvReasoningEffort         = "PERCEPTEA_REASONING_EFFORT"
 	EnvTemperature             = "PERCEPTEA_TEMPERATURE"
 	EnvMaxConcurrency          = "PERCEPTEA_MAX_CONCURRENCY"
 	EnvRequestTimeout          = "PERCEPTEA_REQUEST_TIMEOUT"
@@ -37,8 +38,14 @@ const (
 	// endpoint: the client appends /chat/completions to it.
 	DefaultInferenceBaseURL = "https://api.deepinfra.com/v1/openai"
 	// DefaultModel is the model scored when neither PERCEPTEA_MODEL nor the
-	// request body names one. It is a model the endpoint above publishes.
-	DefaultModel = "zai-org/GLM-5.3-Flash"
+	// request body names one. It is a model the endpoint above publishes,
+	// and it is chosen for the shape of this workload rather than for its
+	// size: it does not reason, so a 32 token scoring reply is never spent
+	// on thinking tokens; it supports the JSON schema response format the
+	// scorer asks for first; and input tokens are what a fan-out of small
+	// calls is billed for, which is where it is cheapest. See the README's
+	// "Choosing a model".
+	DefaultModel = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 	// DefaultTemperature is 0 because it is the only setting that makes a
 	// classification reproducible.
 	DefaultTemperature = 0.0
@@ -67,6 +74,22 @@ const (
 	LogFormatJSON = "json"
 )
 
+// Reasoning efforts understood by PERCEPTEA_REASONING_EFFORT. They are the
+// values the OpenAI-compatible reasoning_effort field takes. Unset is not one
+// of them: it means the field is not sent at all.
+const (
+	EffortNone   = "none"
+	EffortLow    = "low"
+	EffortMedium = "medium"
+	EffortHigh   = "high"
+)
+
+// ReasoningEfforts lists the accepted values in the order an error message
+// should offer them.
+func ReasoningEfforts() []string {
+	return []string{EffortNone, EffortLow, EffortMedium, EffortHigh}
+}
+
 // Config is the resolved server configuration.
 type Config struct {
 	// Addr is the listen address, as accepted by net.Listen.
@@ -81,6 +104,13 @@ type Config struct {
 	APIKey string
 	// Model is the default model for requests that do not name one.
 	Model string
+	// ReasoningEffort is sent to the provider as reasoning_effort on every
+	// scoring and generate call. Empty — the default — sends no reasoning
+	// field at all, which is what a provider that has never seen one
+	// expects. It is server-side only: a request body cannot override it,
+	// because it is a property of the model the operator chose and not of
+	// the question being asked.
+	ReasoningEffort string
 	// Temperature is the default sampling temperature.
 	Temperature float64
 	// MaxConcurrency bounds in-flight scoring calls per evaluation.
@@ -102,6 +132,22 @@ type Config struct {
 // APIKeyConfigured reports whether the server holds a key of its own. It never
 // exposes the key itself.
 func (c Config) APIKeyConfigured() bool { return c.APIKey != "" }
+
+// quotedList renders values as `"a", "b" or "c"` for an error message.
+func quotedList(values []string) string {
+	quoted := make([]string, 0, len(values))
+	for _, v := range values {
+		quoted = append(quoted, strconv.Quote(v))
+	}
+	switch len(quoted) {
+	case 0:
+		return ""
+	case 1:
+		return quoted[0]
+	default:
+		return strings.Join(quoted[:len(quoted)-1], ", ") + " or " + quoted[len(quoted)-1]
+	}
+}
 
 // Load reads the configuration from the process environment.
 func Load() (Config, error) { return LoadFrom(os.Getenv) }
@@ -147,6 +193,19 @@ func LoadFrom(env func(string) string) (Config, error) {
 	}
 	if v := get(EnvModel); v != "" {
 		cfg.Model = v
+	}
+
+	// An effort the provider would reject is a 400 on every scoring call of
+	// every request, so it is caught here like any other malformed setting.
+	if v := get(EnvReasoningEffort); v != "" {
+		effort := strings.ToLower(v)
+		switch effort {
+		case EffortNone, EffortLow, EffortMedium, EffortHigh:
+			cfg.ReasoningEffort = effort
+		default:
+			return Config{}, fmt.Errorf("%s: %q is not a reasoning effort; expected %s",
+				EnvReasoningEffort, v, quotedList(ReasoningEfforts()))
+		}
 	}
 
 	// PERCEPTEA_API_KEY is the only variable a key is read from. Nothing here
