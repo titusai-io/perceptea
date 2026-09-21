@@ -428,3 +428,101 @@ func TestStatementsFollowDeclarationOrder(t *testing.T) {
 		})
 	}
 }
+
+// wantCandidatesHeader is the candidate list's opening line, written out by
+// hand for the reason the examples header is: a golden taken from the
+// constant would ratify an edit to it rather than catch one, and this wording
+// is what the accuracy measurement was made against.
+const wantCandidatesHeader = "The candidates for this question, exactly one of which is correct:"
+
+// The block is a header line and one hyphen-led line per candidate statement,
+// in declaration order, and those are the bytes the measurement behind it used.
+func TestCandidatesBlock(t *testing.T) {
+	tests := []struct {
+		name     string
+		document string
+		question string
+		want     string
+	}{
+		{
+			name:     "a choice lists one line per option, in declaration order",
+			question: "department",
+			document: `{"department": {
+				"type": "choice",
+				"instructions": "Which team should handle this?",
+				"criteria": {"zeta": "Last declared", "alpha": "First declared", "middle": ""}
+			}}`,
+			want: wantCandidatesHeader +
+				"\n- The correct which team should handle this is \"zeta\" (Last declared)." +
+				"\n- The correct which team should handle this is \"alpha\" (First declared)." +
+				"\n- The correct which team should handle this is \"middle\".",
+		},
+		{
+			name:     "a score lists one line per level",
+			question: "urgency",
+			document: `{"urgency": {"type": "score", "criteria": ["Low", "Medium", "High"]}}`,
+			want: wantCandidatesHeader +
+				"\n- On the scale for \"Rate \"urgency\"\", the most appropriate rating is level 0: \"Low\"." +
+				"\n- On the scale for \"Rate \"urgency\"\", the most appropriate rating is level 1: \"Medium\"." +
+				"\n- On the scale for \"Rate \"urgency\"\", the most appropriate rating is level 2: \"High\".",
+		},
+		{
+			name:     "two candidates are still a list",
+			question: "department",
+			document: `{"department": {
+				"type": "choice",
+				"instructions": "Which team?",
+				"criteria": {"billing": "Charges", "technical": "Bugs"}
+			}}`,
+			want: wantCandidatesHeader +
+				"\n- The correct which team is \"billing\" (Charges)." +
+				"\n- The correct which team is \"technical\" (Bugs).",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q, ok := mustQuestions(t, tc.document).Get(tc.question)
+			if !ok {
+				t.Fatalf("question %q missing from the decoded request", tc.question)
+			}
+			declared := statements(tc.question, q)
+			if len(declared) < 2 {
+				t.Fatalf("the fixture declares %d candidates; a block needs two to have anything to show", len(declared))
+			}
+			if got := CandidatesBlock(declared); got != tc.want {
+				t.Fatalf("CandidatesBlock:\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A question with one candidate has nothing to choose among, so it renders
+// nothing at all and produces the prompt it produced before the block
+// existed. An empty block and a block of whitespace are different things to
+// whatever assembles the prompt around it, so this one is empty.
+func TestCandidatesBlockIsEmptyBelowTwoCandidates(t *testing.T) {
+	t.Run("a question with one candidate", func(t *testing.T) {
+		qs := mustQuestions(t, `{
+			"angry": {"type": "noul", "instructions": "Is the customer angry?"},
+			"solo": {"type": "choice", "instructions": "Is it billing?", "criteria": {"billing": "Charges"}}
+		}`)
+		for name, q := range qs.All() {
+			declared := statements(name, q)
+			if len(declared) != 1 {
+				t.Fatalf("%s: the fixture declares %d candidates, want exactly 1", name, len(declared))
+			}
+			if got := CandidatesBlock(declared); got != "" {
+				t.Errorf("%s: CandidatesBlock = %q, want the empty string", name, got)
+			}
+		}
+	})
+
+	t.Run("no candidates at all", func(t *testing.T) {
+		for _, declared := range [][]string{nil, {}} {
+			if got := CandidatesBlock(declared); got != "" {
+				t.Errorf("CandidatesBlock(%q) = %q, want the empty string", declared, got)
+			}
+		}
+	})
+}

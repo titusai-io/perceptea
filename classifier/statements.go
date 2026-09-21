@@ -202,3 +202,57 @@ func statements(name string, q Question) []string {
 		return []string{NoulStatement(name, q.Instructions)}
 	}
 }
+
+// The labels of the candidate-list block: one header line, then one line per
+// candidate statement.
+//
+// The wording is pinned, and pinned harder than most of the prompt. It is not
+// spelled the way the EXAMPLES block is — no upper-case label — because these
+// are the exact bytes the accuracy measurement behind the block was made
+// against, on a held-out set of 764 questions, and a tidier phrasing is an
+// untested one.
+const (
+	candidatesHeader = "The candidates for this question, exactly one of which is correct:"
+	candidateBullet  = "\n- "
+)
+
+// CandidatesBlock renders every candidate answer of one question as one
+// labelled block: a header line, then each statement on a line of its own, in
+// the order the candidates were declared. Fewer than two candidates renders
+// the empty string, so nothing downstream mentions a list at all.
+//
+// It takes the statements rather than the question so that the list is, by
+// construction, the same strings the wave is about to score one at a time:
+// re-deriving them here would let the list and the scored candidates drift
+// apart, and a list that names a statement nobody is scoring is a worse
+// prompt than no list.
+//
+// A question with one candidate — a noul, a one-option choice — renders
+// nothing on purpose. A list of one is not something to choose among; it is
+// the statement repeated, and it would change that question's prompt for no
+// gain.
+//
+// The block exists because a candidate scored in ignorance of its rivals
+// cannot be compared with them, and comparison is most of what a multi-option
+// question asks for. On a held-out set of 764 questions, adding it raised
+// accuracy and lowered the Brier score on both models tried, and the movement
+// was confined to the questions with several options while the binary ones
+// stayed where they were — which is the pattern that tells an effect from
+// noise. The README has the numbers.
+//
+// Like [ExamplesBlock], the whole thing is one string, and that is the point:
+// a backend places it in the part of the prompt that is identical for every
+// candidate of the question, so it is rendered once per question and costs
+// nothing extra on an endpoint that caches a matching prefix.
+func CandidatesBlock(candidates []string) string {
+	if len(candidates) < 2 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(candidatesHeader)
+	for _, statement := range candidates {
+		b.WriteString(candidateBullet)
+		b.WriteString(statement)
+	}
+	return b.String()
+}

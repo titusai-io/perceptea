@@ -143,6 +143,19 @@ func TestScoreSendsTheExactLevelOneRequest(t *testing.T) {
 const fixtureExamples = "EXAMPLES (worked answers for other states, as guidance; judge only the STATE below):" +
 	"\n\nEXAMPLE 1 STATE:\nthe pump is stalled\nEXAMPLE 1 ANSWER: the correct option is \"technical\"."
 
+// fixtureCandidates stands in for the block the classifier renders for a
+// question with more than one candidate: the fixture statement and one rival.
+// Its wording is pinned where it is built, in the classifier's
+// TestCandidatesBlock; what these tests care about is where it lands.
+const fixtureCandidates = "The candidates for this question, exactly one of which is correct:" +
+	"\n- It is raining.\n- " + fixtureRival
+
+// fixtureRival is the candidate in that list which is not the one being
+// judged. It is what a test looks for to tell the shared list apart from the
+// one statement this call is about: it belongs in the prefix and nowhere
+// near the suffix.
+const fixtureRival = "It is not raining."
+
 // TestThePrefixIsByteIdenticalForEveryCandidateOfAQuestion is the assertion
 // the two-message layout exists for. Every candidate answer of one question is
 // judged against the same instruction, the same worked examples and the same
@@ -153,6 +166,12 @@ const fixtureExamples = "EXAMPLES (worked answers for other states, as guidance;
 // defeats the caching silently. Every call still answers, every probability is
 // still right, and nothing says a word about it except the bill; so the bytes
 // are what is asserted, not the intent.
+//
+// This is the case where the question declares no candidate list, which is
+// what lets it assert the strong form: no candidate's statement appears in
+// the prefix at all. A question that does declare one names every statement
+// there on purpose, and is checked by
+// [TestThePrefixIsByteIdenticalWhenTheQuestionDeclaresACandidateList].
 func TestThePrefixIsByteIdenticalForEveryCandidateOfAQuestion(t *testing.T) {
 	const instructions = "Which team should handle this?"
 	// Real statements for real candidates of one question, so that whatever a
@@ -286,6 +305,147 @@ func TestAQuestionWithoutExamplesLeavesNoTraceOfThem(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The candidate list is identical for every candidate of a question, so it
+// belongs in the shared prefix, between the examples and the state. In the
+// suffix it would be re-sent, and re-charged, once per candidate — and being
+// free is most of the argument for sending it at all.
+func TestTheCandidateListGoesInThePrefixAndNowhereElse(t *testing.T) {
+	api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+	client, _ := newTestClient(t, api, nil)
+
+	req := fixtureRequest
+	req.Examples = fixtureExamples
+	req.Candidates = fixtureCandidates
+	if _, err := client.Score(context.Background(), req); err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+
+	msgs := api.messages(t, 0)
+	want := wantInstruction + "\n\n" + fixtureExamples + "\n\n" + fixtureCandidates + "\n\nSTATE:\nthe sky is grey"
+	if msgs[0].Content != want {
+		t.Errorf("prefix mismatch\n got: %q\nwant: %q", msgs[0].Content, want)
+	}
+	if !strings.Contains(msgs[0].Content, fixtureRival) {
+		t.Errorf("the rival candidate never reached the prefix, so the model has nothing to compare with: %q", msgs[0].Content)
+	}
+	if msgs[1].Content != wantSuffix {
+		t.Errorf("the suffix carries this one statement and no part of the list\n got: %q\nwant: %q", msgs[1].Content, wantSuffix)
+	}
+	if strings.Contains(msgs[1].Content, fixtureRival) {
+		t.Errorf("a rival candidate reached the per-candidate suffix, where it is paid for again on every call: %q", msgs[1].Content)
+	}
+}
+
+// A noul has one candidate and a one-option choice has one, so neither has
+// anything to choose among and neither renders a list. Such a question
+// produces the prompt it produced before candidate lists existed, down to the
+// byte.
+func TestAQuestionWithoutACandidateListLeavesNoTraceOfIt(t *testing.T) {
+	for _, tc := range []struct{ name, candidates string }{
+		{"one candidate, so nothing rendered", ""},
+		{"a list that is only whitespace", "  \n  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+			client, _ := newTestClient(t, api, nil)
+
+			req := fixtureRequest
+			req.Candidates = tc.candidates
+			if _, err := client.Score(context.Background(), req); err != nil {
+				t.Fatalf("Score: %v", err)
+			}
+
+			msgs := api.messages(t, 0)
+			if msgs[0].Content != wantPrefix {
+				t.Errorf("prefix mismatch\n got: %q\nwant: %q", msgs[0].Content, wantPrefix)
+			}
+			if msgs[1].Content != wantSuffix {
+				t.Errorf("suffix mismatch\n got: %q\nwant: %q", msgs[1].Content, wantSuffix)
+			}
+			for i, m := range msgs {
+				if strings.Contains(strings.ToLower(m.Content), "candidate") {
+					t.Errorf("message %d speaks of candidates although the question has only one: %q", i, m.Content)
+				}
+			}
+		})
+	}
+}
+
+// The prefix holds the whole candidate list, which names every candidate
+// including the one this call is judging — so the byte-identity is asserted
+// here without the companion claim that no statement appears in the prefix.
+// That claim is the point of the list and cannot hold beside it; what still
+// has to hold is that the bytes do not move from call to call, and that the
+// suffix stays one candidate's own.
+func TestThePrefixIsByteIdenticalWhenTheQuestionDeclaresACandidateList(t *testing.T) {
+	const instructions = "Which team should handle this?"
+	statements := []string{
+		classifier.ChoiceStatement("department", instructions, "billing", "Charges, refunds, invoices"),
+		classifier.ChoiceStatement("department", instructions, "technical", "Bugs"),
+		classifier.ChoiceStatement("department", instructions, "sales", "Pricing and plans"),
+		classifier.ChoiceStatement("department", instructions, "other", ""),
+	}
+	// Two candidates that rendered the same statement would make the
+	// per-candidate assertions below true for the wrong reason.
+	for i := range statements {
+		for j := i + 1; j < len(statements); j++ {
+			if statements[i] == statements[j] {
+				t.Fatalf("candidates %d and %d render the same statement %q; "+
+					"this fixture cannot tell one candidate's prompt from another's", i, j, statements[i])
+			}
+		}
+	}
+
+	candidates := classifier.CandidatesBlock(statements)
+	// A list that had dropped a candidate would satisfy every assertion
+	// about the prefix carrying it.
+	for i, statement := range statements {
+		if !strings.Contains(candidates, statement) {
+			t.Fatalf("the rendered list does not name candidate %d, so this fixture proves nothing about it:\n%q", i, candidates)
+		}
+	}
+
+	api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+	client, _ := newTestClient(t, api, nil)
+
+	for _, statement := range statements {
+		req := fixtureRequest
+		req.Statement = statement
+		req.Examples = fixtureExamples
+		req.Candidates = candidates
+		if _, err := client.Score(context.Background(), req); err != nil {
+			t.Fatalf("Score(%q): %v", statement, err)
+		}
+	}
+	if api.count() != len(statements) {
+		t.Fatalf("made %d calls, want %d (one per candidate)", api.count(), len(statements))
+	}
+
+	first := api.messages(t, 0)
+	for i, statement := range statements {
+		msgs := api.messages(t, i)
+		if msgs[0].Content != first[0].Content {
+			t.Errorf("candidate %d sent a different prefix, so the wave has none to cache\n got: %q\nwant: %q",
+				i, msgs[0].Content, first[0].Content)
+		}
+		if !strings.Contains(msgs[0].Content, candidates) {
+			t.Errorf("candidate %d's prefix does not carry the list: %q", i, msgs[0].Content)
+		}
+		if !strings.Contains(msgs[1].Content, statement) {
+			t.Errorf("candidate %d's statement is not in its suffix: %q", i, msgs[1].Content)
+		}
+		for j, other := range statements {
+			if j != i && strings.Contains(msgs[1].Content, other) {
+				t.Errorf("candidate %d's suffix names candidate %d too; the list is being repeated per call, not shared: %q",
+					i, j, msgs[1].Content)
+			}
+		}
+		if i > 0 && msgs[1].Content == first[1].Content {
+			t.Errorf("candidate %d sent candidate 0's suffix; the candidate is not reaching the model", i)
+		}
 	}
 }
 

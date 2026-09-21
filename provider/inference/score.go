@@ -39,12 +39,18 @@ const scoreUserSuffix = "\n\nHow likely is the statement true (0–1)?"
 // point of the shape.
 //
 // The first message is the prefix: the estimator instruction, the question's
-// worked examples when it declares any, and the state. Every candidate answer
-// of one question is judged against exactly those three, so the prefix is
-// byte-identical for the whole wave — a choice of four, a score of four and a
-// noul are nine calls and three prefixes, each sent several times over — and
-// an endpoint that caches a matching prompt prefix serves the repeats from the
-// cache. Only the suffix is then new work.
+// worked examples when it declares any, its candidate list when it has more
+// than one candidate, and the state. Every candidate answer of one question is
+// judged against exactly those, so the prefix is byte-identical for the whole
+// wave — a choice of four, a score of four and a noul are nine calls and three
+// prefixes, each sent several times over — and an endpoint that caches a
+// matching prompt prefix serves the repeats from the cache. Only the suffix is
+// then new work.
+//
+// The candidate list is the reason a question's own rivals can be shown at no
+// cost. It is the same bytes for every candidate of the question, so it rides
+// in the cacheable part: no extra call, and no extra uncached token after the
+// first candidate.
 //
 // Nothing that varies by candidate may go in the prefix. One index, one count,
 // one reordering and every call diverges at its first differing token; there
@@ -59,10 +65,10 @@ const scoreUserSuffix = "\n\nHow likely is the statement true (0–1)?"
 // has never heard of is one more thing for it to reject.
 
 // promptPrefix renders the half of the prompt every candidate of one question
-// shares: an instruction, the question's examples when it declares any, and
-// the state. Both scorers build their prefix with it and differ only in the
-// instruction they pass, so the layout — and the caching property that depends
-// on it — cannot drift between them.
+// shares: an instruction, the question's examples when it declares any, its
+// candidate list when it has one, and the state. Both scorers build their
+// prefix with it and differ only in the instruction they pass, so the layout —
+// and the caching property that depends on it — cannot drift between them.
 //
 // The examples arrive already rendered as one labelled block. The tempting
 // alternative is to stage each of them as a prior exchange — a user turn
@@ -71,12 +77,28 @@ const scoreUserSuffix = "\n\nHow likely is the statement true (0–1)?"
 // examples written that way differ on every call of the wave and there is no
 // shared prefix left to cache. A labelled block teaches the same thing and
 // stays identical across the wave.
-func promptPrefix(instruction, examples, state string) string {
+//
+// The candidate list arrives the same way and goes in the same place, after
+// the examples and before the state. It names every candidate of the question
+// including this one, which is exactly why it may be shared: it says what is
+// being chosen among, and nothing about which candidate this call is judging.
+// That is still in the suffix, and it is still the only thing the model is
+// asked to put a number on.
+//
+// Either block may be empty — a question with no examples, a question with one
+// candidate — and an empty one renders nothing whatever, separators included,
+// so such a question produces the prompt it would have produced before either
+// existed.
+func promptPrefix(instruction, examples, candidates, state string) string {
 	var b strings.Builder
 	b.WriteString(instruction)
 	b.WriteString("\n\n")
 	if strings.TrimSpace(examples) != "" {
 		b.WriteString(examples)
+		b.WriteString("\n\n")
+	}
+	if strings.TrimSpace(candidates) != "" {
+		b.WriteString(candidates)
 		b.WriteString("\n\n")
 	}
 	b.WriteString(scoreStateLabel)
@@ -85,8 +107,8 @@ func promptPrefix(instruction, examples, state string) string {
 }
 
 // scorePrefix renders the chat scorer's shared prefix.
-func scorePrefix(examples, state string) string {
-	return promptPrefix(scoreInstruction, examples, state)
+func scorePrefix(examples, candidates, state string) string {
+	return promptPrefix(scoreInstruction, examples, candidates, state)
 }
 
 // scoreSuffix renders the half that changes: this one candidate's statement
@@ -183,7 +205,7 @@ func (c *Client) scoreByChat(ctx context.Context, req classifier.ScoreRequest) (
 	// endpoint accepts: a chat template that insists its roles alternate
 	// would reject two user turns in a row.
 	messages := []chatMessage{
-		{Role: "system", Content: scorePrefix(req.Examples, req.State)},
+		{Role: "system", Content: scorePrefix(req.Examples, req.Candidates, req.State)},
 		{Role: "user", Content: scoreSuffix(req.Statement)},
 	}
 

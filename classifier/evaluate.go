@@ -165,6 +165,13 @@ type candidate struct {
 	// what lets a backend keep the part of the prompt holding them identical
 	// across the whole wave.
 	examples string
+	// candidates is the question's whole candidate list, already rendered as
+	// one block, or empty when the question has only one candidate. Every
+	// candidate of a question carries the same bytes, for the same reason
+	// examples does: it belongs in the shared part of the prompt, and a
+	// per-candidate difference there would cost the whole wave its cache
+	// without changing a single answer.
+	candidates string
 }
 
 // parallelTasks lists every candidate of every question, in declaration
@@ -189,8 +196,19 @@ func parallelTasks(qs Questions) ([]candidate, error) {
 		if err != nil {
 			return nil, fmt.Errorf("classifier: question %q: rendering examples: %w", name, err)
 		}
-		for ci, statement := range statements(name, q) {
-			tasks = append(tasks, candidate{question: qi, index: ci, statement: statement, examples: examples})
+		declared := statements(name, q)
+		// The candidate list, once per question for the same reason and from
+		// the very statements about to be scored, so the list and the wave
+		// cannot disagree about what the candidates are.
+		candidates := CandidatesBlock(declared)
+		for ci, statement := range declared {
+			tasks = append(tasks, candidate{
+				question:   qi,
+				index:      ci,
+				statement:  statement,
+				examples:   examples,
+				candidates: candidates,
+			})
 		}
 	}
 	return tasks, nil
@@ -272,6 +290,7 @@ func (e *Evaluator) scoreCalls(model string, temperature float64, state string, 
 				State:       state,
 				Statement:   task.statement,
 				Examples:    task.examples,
+				Candidates:  task.candidates,
 				Temperature: temperature,
 			})
 			if err != nil {

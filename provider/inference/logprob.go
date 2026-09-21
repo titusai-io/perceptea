@@ -55,16 +55,16 @@ const logprobUserSuffix = "\n\nIs the statement true? Answer Yes or No."
 // logprobPrefix renders the half of the prompt every candidate of one question
 // shares, and logprobSuffix the half that changes. The cut falls exactly where
 // the chat scorer's does, and for the same reason: every candidate of one
-// question is judged against one instruction, one examples block and one
-// state, so those three bytes-for-bytes repeat across the wave and an endpoint
-// that caches a matching prefix serves the repeats from its cache. See the
-// note above [promptPrefix].
+// question is judged against one instruction, one examples block, one
+// candidate list and one state, so those four repeat bytes-for-bytes across
+// the wave and an endpoint that caches a matching prefix serves the repeats
+// from its cache. See the note above [promptPrefix].
 //
 // Nothing that varies by candidate may go in the prefix, here no less than
 // there. The scorer changes what is asked; it does not change what may be
 // shared.
-func logprobPrefix(examples, state string) string {
-	return promptPrefix(logprobInstruction, examples, state)
+func logprobPrefix(examples, candidates, state string) string {
+	return promptPrefix(logprobInstruction, examples, candidates, state)
 }
 
 // logprobSuffix renders this one candidate's statement and the question about
@@ -165,7 +165,7 @@ func (c *Client) scoreByLogprob(ctx context.Context, req classifier.ScoreRequest
 	body := chatRequest{
 		Model: model,
 		Messages: []chatMessage{
-			{Role: "system", Content: logprobPrefix(req.Examples, req.State)},
+			{Role: "system", Content: logprobPrefix(req.Examples, req.Candidates, req.State)},
 			{Role: "user", Content: logprobSuffix(req.Statement)},
 		},
 		Temperature:     req.Temperature,

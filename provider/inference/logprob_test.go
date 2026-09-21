@@ -300,6 +300,106 @@ func TestTheLogprobPromptPutsTheSharedPartsInThePrefix(t *testing.T) {
 	}
 }
 
+// The candidate list is shared by every candidate of a question, so it goes
+// where the examples and the state go. The logprob scorer asks a different
+// question; it does not get a different layout.
+func TestTheLogprobPromptPutsTheCandidateListInThePrefix(t *testing.T) {
+	api := alwaysJSON(t, logprobFixture{chosen: " Yes", top: yesNo}.body())
+	client, _ := newLogprobClient(t, api, nil)
+
+	req := fixtureRequest
+	req.Examples = fixtureExamples
+	req.Candidates = fixtureCandidates
+	if _, err := client.Score(context.Background(), req); err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+
+	msgs := api.messages(t, 0)
+	want := wantLogprobInstruction + "\n\n" + fixtureExamples + "\n\n" + fixtureCandidates + "\n\nSTATE:\nthe sky is grey"
+	if msgs[0].Content != want {
+		t.Errorf("prefix mismatch\n got: %q\nwant: %q", msgs[0].Content, want)
+	}
+	if !strings.Contains(msgs[0].Content, fixtureRival) {
+		t.Errorf("the rival candidate never reached the prefix, so the model has nothing to compare with: %q", msgs[0].Content)
+	}
+	if msgs[1].Content != wantLogprobSuffix {
+		t.Errorf("the suffix carries this one statement and no part of the list\n got: %q\nwant: %q", msgs[1].Content, wantLogprobSuffix)
+	}
+	if strings.Contains(msgs[1].Content, fixtureRival) {
+		t.Errorf("a rival candidate reached the per-candidate suffix, where it is paid for again on every call: %q", msgs[1].Content)
+	}
+}
+
+// And the list does not cost the wave its shared prefix, here either: it is
+// the same bytes on every call, which is the only reason it may be sent at
+// all.
+func TestTheLogprobPrefixIsByteIdenticalWhenTheQuestionDeclaresACandidateList(t *testing.T) {
+	const instructions = "Which team should handle this?"
+	statements := []string{
+		classifier.ChoiceStatement("department", instructions, "billing", "Charges, refunds, invoices"),
+		classifier.ChoiceStatement("department", instructions, "technical", "Bugs"),
+		classifier.ChoiceStatement("department", instructions, "sales", "Pricing and plans"),
+		classifier.ChoiceStatement("department", instructions, "other", ""),
+	}
+	// Two candidates rendering the same statement would make what follows
+	// true for the wrong reason.
+	for i := range statements {
+		for j := i + 1; j < len(statements); j++ {
+			if statements[i] == statements[j] {
+				t.Fatalf("candidates %d and %d render the same statement %q; "+
+					"this fixture cannot tell one candidate's prompt from another's", i, j, statements[i])
+			}
+		}
+	}
+
+	candidates := classifier.CandidatesBlock(statements)
+	for i, statement := range statements {
+		if !strings.Contains(candidates, statement) {
+			t.Fatalf("the rendered list does not name candidate %d, so this fixture proves nothing about it:\n%q", i, candidates)
+		}
+	}
+
+	api := alwaysJSON(t, logprobFixture{chosen: " Yes", top: yesNo}.body())
+	client, _ := newLogprobClient(t, api, nil)
+
+	for _, statement := range statements {
+		req := fixtureRequest
+		req.Statement = statement
+		req.Examples = fixtureExamples
+		req.Candidates = candidates
+		if _, err := client.Score(context.Background(), req); err != nil {
+			t.Fatalf("Score(%q): %v", statement, err)
+		}
+	}
+	if api.count() != len(statements) {
+		t.Fatalf("made %d calls, want %d (one per candidate)", api.count(), len(statements))
+	}
+
+	first := api.messages(t, 0)
+	for i, statement := range statements {
+		msgs := api.messages(t, i)
+		if msgs[0].Content != first[0].Content {
+			t.Errorf("candidate %d sent a different prefix, so the wave has none to cache\n got: %q\nwant: %q",
+				i, msgs[0].Content, first[0].Content)
+		}
+		if !strings.Contains(msgs[0].Content, candidates) {
+			t.Errorf("candidate %d's prefix does not carry the list: %q", i, msgs[0].Content)
+		}
+		if !strings.Contains(msgs[1].Content, statement) {
+			t.Errorf("candidate %d's statement is not in its suffix: %q", i, msgs[1].Content)
+		}
+		for j, other := range statements {
+			if j != i && strings.Contains(msgs[1].Content, other) {
+				t.Errorf("candidate %d's suffix names candidate %d too; the list is being repeated per call, not shared: %q",
+					i, j, msgs[1].Content)
+			}
+		}
+		if i > 0 && msgs[1].Content == first[1].Content {
+			t.Errorf("candidate %d sent candidate 0's suffix; the candidate is not reaching the model", i)
+		}
+	}
+}
+
 // The arithmetic, against distributions whose answers were worked out by hand
 // from the probabilities each fixture names.
 func TestLogprobRecoversTheProbabilityFromTheBranches(t *testing.T) {
