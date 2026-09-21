@@ -1165,6 +1165,44 @@ nobody else, carries no such obligation.
   with three questions and nine candidates is nine model calls. Ten questions
   of ten options each is a hundred. `PERCEPTEA_MAX_CONCURRENCY` bounds how
   many run at once, not how many run.
+- **Against a single structured-output call, the premium is per-candidate,
+  not general.** Measured on a held-out set of 764 questions, against one call
+  asking the same model for a full distribution over the same candidates: a
+  `noul` is one call either way and came in at 143 tokens against 198, because
+  this prompt carries no schema to explain. A `score` of three levels cost
+  3.2× as many tokens, and a `choice` averaging 4.2 options cost 3.8×. The
+  ratio is the candidate count, so it is knowable in advance from the question
+  and not a property of the workload. Where an endpoint caches a matching
+  prompt prefix most of that disappears, because the repeats are nearly all
+  prefix; where it does not, the multiple is paid in full.
+- **No accuracy advantage over that single call has been demonstrated, and
+  the probabilities are only robustly better with a fitted softmax
+  temperature.** On the same 764 questions the accuracy was 0.712 against
+  0.688, which a paired test does not support: McNemar gives p = 0.21 pooled,
+  and `choice` questions alone are level at p = 0.92. At the default
+  temperature the Brier score was 0.430 against 0.493, a difference of 0.063
+  with a 95% confidence interval of [0.011, 0.115], but that rests on 108 of
+  the questions: copies of others with the options reordered, or with a "none
+  of these" option added, sometimes in place of the answer. On the other 656
+  the difference was 0.037, [−0.019, 0.093], which is not established. With
+  the temperature [fitted](#the-softmax-temperature) (5.04, cross-fitted) it
+  holds on both: 0.076 [0.031, 0.122] on all 764 and 0.060 [0.010, 0.109] on
+  the 656. The reason to reach for this is a number you can threshold once it
+  is calibrated, not a better answer. Both figures are one model on one
+  labelled set; `perceptea-bench` is how you find out what they are on yours.
+- **A small model fine-tuned for this request shape beats it on accuracy,
+  including on tasks it was never trained on.** Models trained to answer typed
+  yes/no, choice and score questions about a state were run question by
+  question against 656 of the same questions, drawn from eight sources and
+  rule types outside their training data and declared in the request as they
+  are here. At 4B parameters one scored 0.837 and at 9B 0.851, against 0.730
+  here (McNemar p < 0.0001 for both), with Brier scores of 0.254 and 0.237
+  against 0.421. The 0.8B model of the same family scored 0.683, below this
+  (p = 0.018), with a Brier score of 0.460, a difference that is not
+  established ([−0.014, 0.092]). Calibrated by their own shipped temperatures,
+  all three have an expected calibration error between 0.032 and 0.042,
+  against 0.103 here with the temperature fitted. Those models are weights to
+  download and serve; this runs on a chat model an endpoint already serves.
 - **`PERCEPTEA_ALLOW_REQUEST_CREDENTIALS` turns the service into an open
   proxy.** With it on, any caller can supply `inference_base_url` and
   `api_key` and have the service make the call for them — to any host it can

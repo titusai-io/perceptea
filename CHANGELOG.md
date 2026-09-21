@@ -11,6 +11,23 @@ always called out below.
 
 ### Added
 
+- **Limitations now carry the comparison against a single structured-output
+  call.** Measured on a held-out set of 764 questions against one call asking
+  the same model for a full distribution over the same candidates: no
+  accuracy advantage is demonstrated (0.712 against 0.688, McNemar p = 0.21
+  pooled, and `choice` level at p = 0.92). The probabilities are robustly
+  better only with a fitted softmax temperature: at the default the Brier
+  score was 0.430 against 0.493, a difference of 0.063 with a 95% confidence
+  interval of [0.011, 0.115], but on the 656 questions that are not
+  reordered or "none of these" variants it was 0.037, [−0.019, 0.093]; fitted
+  (5.04, cross-fitted) it holds on both, 0.076 [0.031, 0.122] and
+  0.060 [0.010, 0.109]. The token premium is recorded per question type rather
+  than as one number, because it is the candidate count: a `noul` is cheaper
+  than the single call, a `score` of three levels costs 3.2× and a `choice` of
+  four 3.8×. Also recorded: small models fine-tuned for this request shape
+  beat it on accuracy on those 656 questions, from sources outside their
+  training data (0.837 at 4B and 0.851 at 9B, against 0.730, p < 0.0001),
+  while the 0.8B model of the same family scored below it (0.683, p = 0.018).
 - **`PERCEPTEA_SOFTMAX_TEMPERATURE`, the divisor a question's candidate
   logits are softmaxed at.** It is not `PERCEPTEA_TEMPERATURE`, which is the
   sampling temperature the provider is sent; this one is never sent anywhere
