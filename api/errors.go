@@ -92,7 +92,22 @@ func (s *Server) classify(err error) failure {
 		return failure{
 			status:  http.StatusBadGateway,
 			code:    codeUpstreamError,
-			message: truncatedMessage(err),
+			message: withoutPackagePrefix(err.Error()),
+			detail:  err.Error(),
+		}
+
+	// The logprob scorer's two refusals belong with the truncation above,
+	// for the same reason: both are configuration faults that repeat on
+	// every candidate of every request, and both carry the fix in their own
+	// text. An endpoint that will not return logprobs will not return them
+	// for the next candidate either, and a model that answers a Yes-or-No
+	// question with neither word answers the next one the same way — which
+	// is exactly why neither is allowed to become a neutral score.
+	case errors.Is(err, inference.ErrNoLogprobs), errors.Is(err, inference.ErrNoDecisionToken):
+		return failure{
+			status:  http.StatusBadGateway,
+			code:    codeUpstreamError,
+			message: withoutPackagePrefix(err.Error()),
 			detail:  err.Error(),
 		}
 
@@ -117,7 +132,7 @@ func (s *Server) classify(err error) failure {
 		return failure{
 			status:  http.StatusBadRequest,
 			code:    codeUnsupportedMode,
-			message: "this provider cannot serve mode \"oneshot\"; use \"parallel\"",
+			message: oneshotUnsupportedMessage,
 		}
 	// A mode the classifier does not know is the caller's mistake in exactly
 	// the same way an unsupported one is, and is worth the same code.
@@ -132,6 +147,15 @@ func (s *Server) classify(err error) failure {
 			status:  http.StatusBadRequest,
 			code:    codeInvalidRequest,
 			message: "no questions to answer",
+		}
+	// The batch handler rejects an empty "items" before it gets this far, so
+	// this is the belt to that braces: were the check ever to move, an empty
+	// batch would still be the caller's 400 rather than the server's 500.
+	case errors.Is(err, classifier.ErrNoItems):
+		return failure{
+			status:  http.StatusBadRequest,
+			code:    codeInvalidRequest,
+			message: "no items to evaluate",
 		}
 	}
 
@@ -202,20 +226,174 @@ func (s *Server) classifyRead(err error) failure {
 	return failure{status: StatusClientClosedRequest, detail: detail}
 }
 
-// truncatedMessage renders a cut-off reply for the caller.
+// withoutPackagePrefix strips the package name an error was tagged with, so
+// that a message written to be read by an operator reaches them as it was
+// written rather than as "inference: …". It is used for the faults whose own
+// text is the diagnosis and the fix — a truncated reply, an endpoint that
+// returns no logprobs, a model that will not answer the question.
 //
-// Unlike every other upstream failure, the error's own text is already the
-// message worth sending: it names the limit, the cause and the two ways out.
-// Only the package prefix every error in this service carries for the log is
-// dropped, so what the caller reads starts with the finding.
-func truncatedMessage(err error) string {
-	msg := err.Error()
+// It takes the text rather than the error because the batch path has nothing
+// else: see [Server.classifyItem].
+func withoutPackagePrefix(msg string) string {
 	for _, prefix := range []string{"inference: ", "classifier: "} {
 		if after, ok := strings.CutPrefix(msg, prefix); ok {
 			return after
 		}
 	}
 	return msg
+}
+
+// oneshotUnsupportedMessage is what a caller is told when the provider behind
+// this server cannot run one-shot mode. It is a constant because both tables
+// below report it.
+const oneshotUnsupportedMessage = `this provider cannot serve mode "oneshot"; use "parallel"`
+
+// unreachableMessage is what a caller is told about a hop that never reached
+// the provider. It says nothing else on purpose: the text underneath names
+// the endpoint this server calls, which may be an internal host.
+const unreachableMessage = "the upstream provider could not be reached"
+
+// itemFailure is one batch item's error, classified.
+//
+// It is the per-item counterpart of [failure] and carries every part of one
+// but the status: a batch item is not an HTTP response, because the request
+// itself was served, so the status has nothing to be. What is left is the
+// three things that do still apply — the message the caller reads, the code
+// they branch on, and the detail only the log gets.
+type itemFailure struct {
+	code    string
+	message string
+	// detail is logged and never sent to the caller.
+	detail string
+}
+
+// upstreamStatusPrefix is what [inference.APIError.Error] writes before the
+// HTTP status. It is derived from the type rather than copied out of it, so
+// that a change to the wording cannot silently stop [upstreamStatus]
+// matching; TestClassifyItemReadsAnUpstreamStatus pins the pairing either
+// way.
+var upstreamStatusPrefix = strings.TrimSuffix((&inference.APIError{StatusCode: 0}).Error(), "0")
+
+// The per-item faults [classifier.Evaluator.EvaluateBatch] reports for an
+// item it never attempted. Both are the caller's own mistake, both name
+// nothing but the caller's own document, and the classifier exports no
+// sentinel to match them on — so they are matched as text, and
+// TestBatchClassifiesAnItemTheClassifierRejects drives the real classifier so
+// that a change to either wording is a red test rather than a caller who
+// suddenly reads "the upstream provider could not be reached" about their own
+// missing field.
+const (
+	itemNoStatePrefix     = `classifier: item has no "state"`
+	itemRenderStatePrefix = "classifier: rendering state:"
+)
+
+// classifyItem maps one batch item's error onto what its caller is told, the
+// code they can branch on, and what goes to the log.
+//
+// [Server.classify] matches on error values, with errors.Is and errors.As.
+// This cannot: [classifier.BatchResult] reports an item's failure as a
+// string, so by the time a result reaches this package the *inference.APIError
+// or *url.Error behind it has been rendered and thrown away. Classifying the
+// text is what is left, and it has to be done, because the reason the
+// request-level table exists applies here unchanged — the text of a transport
+// failure names the endpoint this server calls, and an unauthenticated caller
+// has no business learning an internal host name.
+//
+// The table is therefore an allow-list. Only the faults this project writes
+// itself, whose own text is the diagnosis and the fix, reach the caller;
+// anything unrecognised is reported as the same opaque upstream failure the
+// single endpoint gives, with its text sent to the log. A deny-list would
+// have to enumerate every way a URL can reach a message, and the one it
+// missed would be the leak.
+//
+// A rule that passes the text on anchors at the start of it, never on a
+// substring. `Post "http://gateway.internal/v1": context deadline exceeded`
+// contains the text of context.DeadlineExceeded, and a Contains rule that
+// returned its input would hand the caller the host. A rule whose message is
+// a fixed string may match anywhere, because none of the original survives.
+func (s *Server) classifyItem(text string) itemFailure {
+	if text == "" {
+		return itemFailure{}
+	}
+
+	// The faults whose own text is the diagnosis and the fix, treated exactly
+	// as the request-level table treats them: the message as it was written,
+	// with the package tag taken off.
+	for _, sentinel := range []error{
+		inference.ErrTruncatedReply,
+		inference.ErrNoLogprobs,
+		inference.ErrNoDecisionToken,
+		classifier.ErrTruncatedReply,
+	} {
+		if strings.HasPrefix(text, sentinel.Error()) {
+			return itemFailure{code: codeUpstreamError, message: withoutPackagePrefix(text)}
+		}
+	}
+
+	// A provider that answered, with a status. The rate limit is split out for
+	// the reason it is at request level: it is the one signal that tells a
+	// caller to back off rather than retry now, and on this endpoint the item
+	// is where they read it.
+	if status, message, ok := upstreamStatus(text); ok {
+		code := codeUpstreamError
+		if status == http.StatusTooManyRequests {
+			code = codeUpstreamRateLimited
+		}
+		return itemFailure{
+			code:    code,
+			message: fmt.Sprintf("upstream provider error (status %d): %s", status, message),
+			detail:  text,
+		}
+	}
+
+	// The caller's own item, rejected before any call was made.
+	if strings.HasPrefix(text, itemNoStatePrefix) || strings.HasPrefix(text, itemRenderStatePrefix) {
+		return itemFailure{code: codeInvalidRequest, message: withoutPackagePrefix(text)}
+	}
+
+	// Fixed messages from here down, so these rules may match anywhere in the
+	// text without carrying any of it to the caller.
+	if strings.Contains(text, classifier.ErrOneshotUnsupported.Error()) {
+		return itemFailure{code: codeUnsupportedMode, message: oneshotUnsupportedMessage, detail: text}
+	}
+	if strings.Contains(text, context.DeadlineExceeded.Error()) {
+		return itemFailure{
+			code:    codeTimeout,
+			message: fmt.Sprintf("the evaluation exceeded the server's %s deadline", s.cfg.RequestTimeout),
+			detail:  text,
+		}
+	}
+
+	return itemFailure{code: codeUpstreamError, message: unreachableMessage, detail: text}
+}
+
+// upstreamStatus reads the HTTP status out of a rendered
+// [inference.APIError], with whatever the provider said after it.
+//
+// The fallback for a provider that said nothing is the one
+// [upstreamMessage] uses, so that the two endpoints report the same silence
+// the same way.
+func upstreamStatus(text string) (status int, message string, ok bool) {
+	rest, found := strings.CutPrefix(text, upstreamStatusPrefix)
+	if !found {
+		return 0, "", false
+	}
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
+	}
+	if digits == 0 {
+		return 0, "", false
+	}
+	status, err := strconv.Atoi(rest[:digits])
+	if err != nil {
+		return 0, "", false
+	}
+	message = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rest[digits:]), ":"))
+	if message == "" {
+		message = "no message"
+	}
+	return status, message, true
 }
 
 // upstreamMessage renders a provider error without echoing its raw body.

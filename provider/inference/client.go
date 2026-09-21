@@ -10,10 +10,49 @@
 // The package depends only on the standard library: the request and response
 // documents are hand-rolled JSON structs rather than a vendored SDK.
 //
+// # Two scorers
+//
+// There are two ways to get a probability out of a model, and Config.Scorer
+// picks between them for the life of a client.
+//
+// The chat scorer — "chat", and the default — asks the model to answer with
+// {"p": 0.87} and parses the number out of the reply. It asks nothing of a
+// provider beyond chat completions, so it works everywhere, and it inherits
+// the model's writing habits: a written probability clusters on 0.8, 0.9 and
+// 0.95, because those are the numbers models write, and the shape of a set of
+// scores is partly the shape of that habit.
+//
+// The logprob scorer — "logprob" — asks the same question as a one-word Yes/No
+// decision, with logprobs and a one-token cap, and never reads the word that
+// comes back. It reads the distribution the word was to be sampled from, and
+// computes P = exp(l_yes) / (exp(l_yes) + exp(l_no)) over the two branches.
+// That is continuous, it is the model's estimate rather than its description
+// of one, and it decodes one token where the other decodes ten, which on a
+// reply this short is most of the latency. It is the better measurement
+// wherever the provider supports it, and the calibration work — thresholds,
+// reliability curves — is what tells you whether it is better for a given
+// model.
+//
+// What it requires is an endpoint that accepts logprobs and top_logprobs on a
+// chat completion and returns the top-k distribution for the generated token.
+// Endpoints differ, models on one endpoint differ, and a gateway may strip the
+// fields on the way through. When the logprobs do not come back the call fails
+// with [ErrNoLogprobs], which names the setting and the model: there is no
+// fall back to the chat scorer, because a service that silently changes
+// estimator keeps producing numbers while quietly changing what they mean.
+// See [ErrNoLogprobs] and [ErrNoDecisionToken].
+//
+// Both scorers send the same two-message prompt layout — a shared system
+// prefix and a per-candidate user suffix — so both get the same prefix
+// caching from an endpoint that offers it.
+//
+// # Concurrency
+//
 // A [Client] is safe for concurrent use and expects to be used that way: one
 // evaluation fans out into many simultaneous Score calls against the same
 // client. The only mutable state is the negotiated structured-output level,
 // which is held in an atomic and only ever moves in the degrading direction.
+// The logprob scorer sends no response_format at all and so never touches it.
 package inference
 
 import (
@@ -64,6 +103,44 @@ type Config struct {
 	BaseURL string
 	// Model is used for any request that does not name a model of its own.
 	Model string
+	// Scorer selects how [Client.Score] obtains a probability. Empty — the
+	// default — is the chat scorer, so a caller that has never heard of this
+	// field gets exactly the behaviour it had before the field existed.
+	//
+	// The two values are "chat" and "logprob", and they name two different
+	// measurements of the same thing:
+	//
+	//   - "chat" asks the model to write a probability as JSON and parses the
+	//     number out of the reply. It works against any endpoint that serves
+	//     chat completions, which is why it is the default. What it returns is
+	//     quantised by the model's writing habits: models type 0.8, 0.9 and
+	//     0.95 and hardly ever 0.87, so the distribution owes as much to how a
+	//     model phrases a number as to what it believes.
+	//
+	//   - "logprob" asks for a one-word Yes/No decision with logprobs, and
+	//     computes the probability from the two branches' log probabilities
+	//     rather than from any word the model wrote. It is continuous where
+	//     the written number clusters on round values, it is the model's
+	//     estimate rather than its description of one, and it decodes a single
+	//     token, which on a reply this short is most of the latency.
+	//
+	// The logprob scorer needs more of the provider than the chat scorer
+	// does: the endpoint must accept logprobs and top_logprobs on a chat
+	// completion and return the top-k distribution for the generated token.
+	// Not every endpoint, and not every model on an endpoint that does,
+	// will. When one will not, the call fails with [ErrNoLogprobs], naming
+	// the setting and the model; it does not fall back to the chat scorer and
+	// it does not return a neutral 0.5. Both of those would keep answering
+	// with numbers that no longer mean what the configuration says they mean.
+	// A model that returns logprobs but will not answer Yes or No fails the
+	// same way, with [ErrNoDecisionToken].
+	//
+	// Both scorers send the same two-message prompt layout, so both get the
+	// same prefix caching; only the instruction and what is read back differ.
+	// The two calibrate differently, though — same question, different
+	// estimator — so a threshold tuned against one is not a threshold for the
+	// other.
+	Scorer string
 	// ReasoningEffort is sent as reasoning_effort on every call. Empty — the
 	// default — sends no reasoning field at all, which is what a provider
 	// that has never heard of one expects. The usual values are "none",
@@ -97,6 +174,7 @@ type Client struct {
 	apiKey          string
 	baseURL         string
 	model           string
+	scorer          string
 	reasoningEffort string
 	httpClient      *http.Client
 	maxRetries      int
@@ -116,7 +194,14 @@ type Client struct {
 }
 
 // New validates cfg and returns a ready client. It returns [ErrNoAPIKey] when
-// no key is configured and [ErrNoBaseURL] when no endpoint is.
+// no key is configured, [ErrNoBaseURL] when no endpoint is, and an error
+// naming both accepted values when Config.Scorer is a word this package does
+// not know.
+//
+// Which scorer [Client.Score] runs is decided here, once, rather than on each
+// call: the choice is configuration, and a client that could change estimator
+// between two candidates of one question would be returning probabilities
+// from two different scales in one answer.
 func New(cfg Config) (*Client, error) {
 	key := strings.TrimSpace(cfg.APIKey)
 	if key == "" {
@@ -136,6 +221,20 @@ func New(cfg Config) (*Client, error) {
 	}
 	if parsed.Host == "" {
 		return nil, fmt.Errorf("inference: invalid base URL %q: no host", base)
+	}
+
+	// An unknown scorer is rejected rather than quietly read as the default.
+	// A typo that fell through to "chat" would answer every request with
+	// numbers from the estimator the operator had just decided not to use,
+	// and nothing anywhere would say so.
+	scorer := strings.TrimSpace(cfg.Scorer)
+	switch scorer {
+	case "":
+		scorer = scorerChat
+	case scorerChat, scorerLogprob:
+	default:
+		return nil, fmt.Errorf("inference: %q is not a scorer: expected %q or %q (%s)",
+			cfg.Scorer, scorerChat, scorerLogprob, envScorer)
 	}
 
 	httpClient := cfg.HTTPClient
@@ -160,6 +259,7 @@ func New(cfg Config) (*Client, error) {
 		apiKey:          key,
 		baseURL:         base,
 		model:           strings.TrimSpace(cfg.Model),
+		scorer:          scorer,
 		reasoningEffort: strings.TrimSpace(cfg.ReasoningEffort),
 		httpClient:      httpClient,
 		maxRetries:      retries,

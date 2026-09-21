@@ -220,6 +220,32 @@ type NoulLabels struct {
 	False string `json:"false,omitempty"`
 }
 
+// Example is one worked answer, shown to the model so that a criterion can be
+// taught by demonstration rather than only described. Which field carries the
+// answer depends on the question's type.
+//
+// Examples are optional everywhere. A question without them produces exactly
+// the prompt it would have produced before they existed.
+type Example struct {
+	// State is the material the example is about, in the same shapes a
+	// request's own state may take.
+	State State
+	// Choice is the correct option key, for a choice question.
+	Choice string
+	// Level is the correct level index, for a score question.
+	Level int
+	// Noul is whether the proposition holds, for a noul question.
+	Noul bool
+}
+
+// exampleWire is the JSON shape of an example: a state and an answer whose
+// type follows the question's. A choice answers with its option key, a score
+// with its level index, a noul with true or false.
+type exampleWire struct {
+	State  State           `json:"state"`
+	Answer json.RawMessage `json:"answer"`
+}
+
 // Question is one declared question. Which fields carry meaning depends on
 // Type: Options for a choice, Levels for a score, Labels for a noul.
 type Question struct {
@@ -234,6 +260,11 @@ type Question struct {
 	Levels []string
 	// Labels holds a noul question's optional true/false descriptions.
 	Labels NoulLabels
+	// Examples are optional worked answers for this question. They are
+	// rendered into the part of the prompt that is identical for every
+	// candidate, so that adding them does not cost the shared prefix a
+	// provider may be caching.
+	Examples []Example
 
 	// declared is the type exactly as the request document wrote it, kept
 	// because Type normalises the TypeBoolean synonym away. The declared
@@ -268,6 +299,7 @@ type questionWire struct {
 	Type         QuestionType    `json:"type"`
 	Instructions string          `json:"instructions,omitempty"`
 	Criteria     json.RawMessage `json:"criteria,omitempty"`
+	Examples     []exampleWire   `json:"examples,omitempty"`
 }
 
 // UnmarshalJSON decodes a question, normalising the "boolean" type synonym to
@@ -304,8 +336,67 @@ func (q *Question) UnmarshalJSON(data []byte) error {
 	default:
 		return fmt.Errorf("unknown question type %q; expected one of %q, %q, %q", wire.Type, TypeChoice, TypeScore, TypeNoul)
 	}
+
+	examples, err := decodeExamples(out.Type, wire.Examples)
+	if err != nil {
+		return err
+	}
+	out.Examples = examples
+
 	*q = out
 	return nil
+}
+
+// decodeExamples reads each example's answer in the terms its question type
+// uses. The answer is decoded here rather than left raw so that a wrong shape
+// is a decode error naming the example, not a surprise at prompt-building
+// time when there is no good way to report it.
+func decodeExamples(t QuestionType, wire []exampleWire) ([]Example, error) {
+	if len(wire) == 0 {
+		return nil, nil
+	}
+	out := make([]Example, 0, len(wire))
+	for i, w := range wire {
+		ex := Example{State: w.State}
+		if w.State.IsZero() {
+			return nil, fmt.Errorf("example %d is missing %q", i, "state")
+		}
+		// An example that answers nothing is caught here rather than left to
+		// the decode below, because two of the three types would not catch it
+		// at all: JSON null unmarshals into an int and into a bool without
+		// error and leaves the Go zero value, so a score would teach level 0
+		// and a noul would teach false — an answer the request never gave,
+		// shown to the model on every candidate of the question. A choice
+		// escapes that only because "" is not a declared option key, which
+		// makes the three types disagree over the same document.
+		if answerIsMissing(w.Answer) {
+			return nil, fmt.Errorf("example %d is missing %q", i, "answer")
+		}
+		switch t {
+		case TypeChoice:
+			if err := json.Unmarshal(w.Answer, &ex.Choice); err != nil {
+				return nil, fmt.Errorf("example %d: a choice question's example answers with an option key, as a string: %w", i, err)
+			}
+		case TypeScore:
+			if err := json.Unmarshal(w.Answer, &ex.Level); err != nil {
+				return nil, fmt.Errorf("example %d: a score question's example answers with a level index, as a whole number: %w", i, err)
+			}
+		case TypeNoul, TypeBoolean:
+			if err := json.Unmarshal(w.Answer, &ex.Noul); err != nil {
+				return nil, fmt.Errorf("example %d: a noul question's example answers with true or false: %w", i, err)
+			}
+		}
+		out = append(out, ex)
+	}
+	return out, nil
+}
+
+// answerIsMissing reports whether an example gave no answer at all: the key
+// was left out, or it was written as null. The two are the same omission, and
+// are worth the same message.
+func answerIsMissing(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
 }
 
 // MarshalJSON writes the question back in its wire shape, with the type as it

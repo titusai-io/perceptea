@@ -28,6 +28,8 @@ const (
 	EnvAllowRequestCredentials = "PERCEPTEA_ALLOW_REQUEST_CREDENTIALS"
 	EnvLogLevel                = "PERCEPTEA_LOG_LEVEL"
 	EnvLogFormat               = "PERCEPTEA_LOG_FORMAT"
+	EnvScorer                  = "PERCEPTEA_SCORER"
+	EnvMaxBatchItems           = "PERCEPTEA_MAX_BATCH_ITEMS"
 )
 
 // Defaults applied when a variable is unset or empty.
@@ -66,6 +68,21 @@ const (
 	DefaultLogLevel = slog.LevelInfo
 	// DefaultLogFormat is human-readable text.
 	DefaultLogFormat = LogFormatText
+
+	// ScorerChat asks the model to write a probability as JSON. It is the
+	// default because it works against any endpoint.
+	ScorerChat = "chat"
+	// ScorerLogprob reads the probability out of the token logits instead
+	// of asking the model to write one. Continuous where a written number
+	// clusters on round values, and it skips decode entirely — but it
+	// needs an endpoint that returns logprobs.
+	ScorerLogprob = "logprob"
+	// DefaultScorer is the one that works everywhere.
+	DefaultScorer = ScorerChat
+	// DefaultMaxBatchItems bounds one batch. A batch fans out into items
+	// times candidates calls, so the ceiling is what stops a single request
+	// committing to an unbounded amount of provider spend.
+	DefaultMaxBatchItems = 100
 )
 
 // Log formats understood by PERCEPTEA_LOG_FORMAT.
@@ -127,6 +144,11 @@ type Config struct {
 	LogLevel slog.Level
 	// LogFormat is either LogFormatText or LogFormatJSON.
 	LogFormat string
+	// Scorer names how a probability is obtained: ScorerChat or
+	// ScorerLogprob.
+	Scorer string
+	// MaxBatchItems is the most states one batch request may carry.
+	MaxBatchItems int
 }
 
 // APIKeyConfigured reports whether the server holds a key of its own. It never
@@ -175,6 +197,8 @@ func LoadFrom(env func(string) string) (Config, error) {
 		AllowRequestCredentials: DefaultAllowRequestCredentials,
 		LogLevel:                DefaultLogLevel,
 		LogFormat:               DefaultLogFormat,
+		Scorer:                  DefaultScorer,
+		MaxBatchItems:           DefaultMaxBatchItems,
 	}
 
 	if v := get(EnvAddr); v != "" {
@@ -280,6 +304,28 @@ func LoadFrom(env func(string) string) (Config, error) {
 		default:
 			return Config{}, fmt.Errorf("%s: %q is not a format; expected %q or %q", EnvLogFormat, v, LogFormatText, LogFormatJSON)
 		}
+	}
+
+	if v := get(EnvScorer); v != "" {
+		switch strings.ToLower(v) {
+		case ScorerChat:
+			cfg.Scorer = ScorerChat
+		case ScorerLogprob:
+			cfg.Scorer = ScorerLogprob
+		default:
+			return Config{}, fmt.Errorf("%s: %q is not a scorer; expected %q or %q", EnvScorer, v, ScorerChat, ScorerLogprob)
+		}
+	}
+
+	if v := get(EnvMaxBatchItems); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %q is not a whole number", EnvMaxBatchItems, v)
+		}
+		if n < 1 {
+			return Config{}, fmt.Errorf("%s: must be at least 1, got %d", EnvMaxBatchItems, n)
+		}
+		cfg.MaxBatchItems = n
 	}
 
 	return cfg, nil

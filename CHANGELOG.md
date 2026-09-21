@@ -11,6 +11,26 @@ always called out below.
 
 ### Added
 
+- **`cmd/perceptea-bench`, a calibration benchmark.** Reads a labelled JSON
+  Lines dataset and reports Brier score, expected calibration error over ten
+  bins with the reliability table, accuracy, mean absolute error, and how many
+  cases actually ran. It exists because everything else here is a claim about
+  accuracy: without it, "this model is better calibrated" or "the new prompt
+  is no worse" cannot be checked. `-json` output carries no timestamp and is
+  rounded, so two runs diff cleanly. Interrupting a run prints the report for
+  the attempts that finished and exits non-zero saying how many there were,
+  rather than discarding minutes of paid-for calls; a credential carried in
+  `PERCEPTEA_INFERENCE_BASE_URL` is struck out of every failure the report
+  records, because that document is one you are told to store and diff.
+- **`PERCEPTEA_SCORER=chat|logprob`.** The default `chat` asks the model to
+  write a probability. `logprob` asks a one-word Yes or No and computes the
+  answer from the first token's distribution, which is continuous where a
+  written number clusters on 0.8, 0.9 and 0.95, and decodes one token instead
+  of ten. It needs an endpoint and a model that return logprobs, and when they
+  do not it is a 502 naming the setting rather than a neutral score — the two
+  scorers are different estimators, so thresholds do not transfer between
+  them.
+
 - **Licensed under the GNU Affero General Public License v3.0.**
 
 - **The `classifier` package**: a reusable, standard-library-only classifier.
@@ -43,8 +63,66 @@ always called out below.
   `distroless/static`, roughly 9 MB, running as `nonroot` with a read-only
   root filesystem. Since the image has no shell, `perceptea -healthcheck`
   probes the running instance from inside it.
+- **The scoring prompt is laid out so its prefix can be cached.** A scoring
+  call is sent as two messages: the estimator instruction, the question's
+  worked examples and the state in the first, and the one statement being
+  judged in the second. The first is byte-identical for every candidate of a
+  question — a choice of 4, a score of 4 and a noul are 9 calls and 3
+  prefixes — so an endpoint that caches a matching prompt prefix bills the
+  repeats at the cached rate. Nothing that varies by candidate may appear in
+  it, and a test asserts the bytes rather than the intent, because a stray
+  index or count would defeat the caching with no symptom except the bill. No
+  cache-control field is sent: the match is what does it, and a field an
+  endpoint has never heard of is one more thing for it to reject.
+- **`examples`: optional worked answers on any question.** Each is a state
+  and the answer that was correct for it, written in the question type's own
+  terms — an option key, a level index, or `true`/`false`. They render into
+  the shared prefix as one labelled block, so they are shown once per
+  question rather than once per candidate. A question that declares none
+  produces exactly the prompt it produced before the field existed.
+- **Examples are validated before any call is made.** A choice example must
+  name a declared option key, a score example a level inside the declared
+  scale, and every example needs a state; each is a `400` naming the question
+  and the `examples` field. An example is read on every call of the wave, so
+  a wrong one is wrong many times over.
+- **`POST /api/evaluate/batch`**: many states, one shared question set, one
+  fan-out. The point is the concurrency budget: `PERCEPTEA_MAX_CONCURRENCY`
+  bounds every candidate of every item together rather than each item
+  separately, so classifying a hundred states no longer means a hundred
+  independent fan-outs competing for the same provider. The shared questions
+  are validated once for the whole batch rather than once per state.
+- **A failed item does not fail the batch.** Items are independent, so each
+  result carries either its answers or its own `error`, and the rest keep
+  theirs — the opposite of a single evaluation, where the first error cancels
+  the wave because every candidate feeds one normalisation. A batch in which
+  every item failed is still a `200`: the request was served even though the
+  items were not, and only a whole-request fault answers from the error
+  table. Results come back in request order with their `index` and the
+  caller's own `id`, and `meta` counts the items, the successes and the
+  failures so the two cases can be told apart without walking the results.
+  A per-item failure goes through the same classification a whole-request one
+  does: the `error` is the message `/api/evaluate` would have sent for the
+  same fault, scrubbed of credentials, and `error_code` beside it carries the
+  code from the error table — `upstream_rate_limited`, `upstream_error`,
+  `timeout`, `invalid_request`, `unsupported_mode` — so an item can be
+  branched on the way a request can. A failure the server cannot vouch for is
+  reported as the opaque upstream error rather than quoted, because its text
+  names the endpoint this server calls.
+- **`PERCEPTEA_MAX_BATCH_ITEMS`** (default `100`) bounds one batch. A batch
+  fans out into items × candidates calls, so the ceiling is what stops a
+  single request committing to an unbounded amount of provider spend; over it
+  is a `400` naming the setting and both numbers. The body limit is
+  deliberately not raised alongside it: 2 MiB across 100 items is about 21 KB
+  per state, far more than the messages this service classifies, and an
+  operator batching documents rather than messages raises
+  `PERCEPTEA_MAX_BODY_BYTES` themselves.
+- **`Evaluator.EvaluateBatch`** in the `classifier` package, on the same
+  machinery as `Evaluate` rather than a second copy of it: both build groups
+  of scorer calls and hand them to one wave, so a batch of one is
+  indistinguishable from a single evaluation and a test says so.
 - **`requests/deepinfra-requests.http`**: runnable examples of every question
-  type, the options, and every failure mode.
+  type, the options, worked examples, batches — including a partial failure —
+  and every failure mode.
 
 ### Security
 

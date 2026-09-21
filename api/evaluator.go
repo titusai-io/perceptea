@@ -75,6 +75,7 @@ func (f *evaluatorFactory) newEvaluator(st Settings) (Evaluator, error) {
 			BaseURL:         st.BaseURL,
 			Model:           st.Model,
 			ReasoningEffort: st.ReasoningEffort,
+			Scorer:          st.Scorer,
 			HTTPClient:      f.client,
 			MaxRetries:      defaultMaxRetries,
 			Referer:         attributionURL,
@@ -112,7 +113,7 @@ func (f *evaluatorFactory) newEvaluator(st Settings) (Evaluator, error) {
 // the first caller's client to the second.
 func clientKey(st Settings) string {
 	sum := sha256.New()
-	for _, part := range []string{st.BaseURL, st.Model, st.APIKey, st.ReasoningEffort} {
+	for _, part := range []string{st.BaseURL, st.Model, st.APIKey, st.ReasoningEffort, st.Scorer} {
 		fmt.Fprintf(sum, "%d:%s", len(part), part)
 	}
 	return hex.EncodeToString(sum.Sum(nil))

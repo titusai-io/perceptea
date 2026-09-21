@@ -13,13 +13,15 @@ import (
 	"github.com/titusai-io/perceptea/internal/config"
 )
 
-// evaluateRequest is the wire shape of POST /api/evaluate. It is a type of
-// this package rather than of classifier because three of its fields are
-// transport concerns: where to send the calls, and with whose key.
-type evaluateRequest struct {
-	State     classifier.State     `json:"state"`
-	Questions classifier.Questions `json:"questions"`
-	Model     string               `json:"model"`
+// requestSettings is the part of a request body that is a transport concern
+// rather than a question: where to send the calls, with whose key, which model
+// and how to ask.
+//
+// It is embedded in every endpoint's own wire type and resolved in one place,
+// because the rules are the same wherever it appears and a second copy of them
+// is a second place for them to drift.
+type requestSettings struct {
+	Model string `json:"model"`
 	// InferenceBaseURL is the API root this one request's scoring calls
 	// should go to, in place of the server's own.
 	InferenceBaseURL string `json:"inference_base_url"`
@@ -30,10 +32,26 @@ type evaluateRequest struct {
 	Mode        string   `json:"mode"`
 }
 
-// handleEvaluate answers one set of questions about one state.
-func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
-	scope := scopeFrom(r.Context())
+// evaluateRequest is the wire shape of POST /api/evaluate.
+type evaluateRequest struct {
+	State     classifier.State     `json:"state"`
+	Questions classifier.Questions `json:"questions"`
+	requestSettings
+}
 
+// resolution is what one request's shared fields came to.
+type resolution struct {
+	settings    Settings
+	model       string
+	temperature float64
+	mode        classifier.Mode
+}
+
+// decodeJSONBody reads the one JSON document a request body has to be into v.
+//
+// It reports false when it has already answered the caller, which is every
+// path but the happy one.
+func (s *Server) decodeJSONBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	// The reader is wrapped so that a failure on the wire can be told apart
 	// from a failure to parse: once encoding/json has passed an error through,
 	// a socket that died and a custom UnmarshalJSON that objected look exactly
@@ -50,35 +68,32 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	// tolerant, and stays so.
 	dec.DisallowUnknownFields()
 
-	var body evaluateRequest
-	if err := dec.Decode(&body); err != nil {
+	if err := dec.Decode(v); err != nil {
 		s.failDecode(w, r, reader.err, err)
-		return
+		return false
 	}
 	// encoding/json stops at the end of the first value and ignores whatever
 	// follows it, so a body of two documents would be half read and wholly
 	// accepted.
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		s.failDecode(w, r, reader.err, errTrailingContent)
-		return
+		return false
 	}
+	return true
+}
 
-	// An explicitly null state counts as absent: a caller who sends null has
-	// given the questions nothing to be asked about.
-	if body.State.IsZero() || body.State.IsNull() {
-		s.writeError(w, r, http.StatusBadRequest, codeInvalidRequest, `missing "state"`)
-		return
-	}
-	if body.Questions.Len() == 0 {
-		s.writeError(w, r, http.StatusBadRequest, codeInvalidRequest, `missing "questions": at least one question is required`)
-		return
-	}
+// resolveSettings turns the shared body fields into the settings this
+// request's evaluator is built from, and records on the request scope what the
+// log line and the scrubber will need.
+//
+// It reports false when it has already answered the caller.
+func (s *Server) resolveSettings(w http.ResponseWriter, r *http.Request, body requestSettings) (resolution, bool) {
+	scope := scopeFrom(r.Context())
 
 	mode := classifier.Mode(strings.TrimSpace(body.Mode))
 	if mode == "" {
 		mode = classifier.ModeParallel
 	}
-	scope.questions = body.Questions.Len()
 	// The mode is the caller's text and is recorded before it is validated, so
 	// what reaches the log is clipped: a 20 KB mode produced a 20 KB log line.
 	scope.mode = clip(string(mode), maxLoggedValue)
@@ -98,7 +113,7 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 			// scrub one.
 			if err := config.ValidateBaseURL(bodyBase); err != nil {
 				s.writeError(w, r, http.StatusBadRequest, codeInvalidRequest, `"inference_base_url" `+err.Error())
-				return
+				return resolution{}, false
 			}
 			baseURL = bodyBase
 		}
@@ -121,16 +136,51 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 		temperature = *body.Temperature
 	}
 
-	evaluator, err := s.newEvaluator(Settings{
-		APIKey:  apiKey,
-		BaseURL: baseURL,
-		Model:   model,
-		// Server-side only, deliberately: the reasoning effort describes
-		// the model the operator chose, and letting a caller raise it
-		// would let them spend the server's key on thinking tokens.
-		ReasoningEffort: s.cfg.ReasoningEffort,
-		MaxConcurrency:  s.cfg.MaxConcurrency,
-	})
+	return resolution{
+		settings: Settings{
+			APIKey:  apiKey,
+			BaseURL: baseURL,
+			Model:   model,
+			// Server-side only, deliberately: the reasoning effort describes
+			// the model the operator chose, and letting a caller raise it
+			// would let them spend the server's key on thinking tokens.
+			ReasoningEffort: s.cfg.ReasoningEffort,
+			Scorer:          s.cfg.Scorer,
+			MaxConcurrency:  s.cfg.MaxConcurrency,
+		},
+		model:       model,
+		temperature: temperature,
+		mode:        mode,
+	}, true
+}
+
+// handleEvaluate answers one set of questions about one state.
+func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
+	scope := scopeFrom(r.Context())
+
+	var body evaluateRequest
+	if !s.decodeJSONBody(w, r, &body) {
+		return
+	}
+
+	// An explicitly null state counts as absent: a caller who sends null has
+	// given the questions nothing to be asked about.
+	if body.State.IsZero() || body.State.IsNull() {
+		s.writeError(w, r, http.StatusBadRequest, codeInvalidRequest, `missing "state"`)
+		return
+	}
+	if body.Questions.Len() == 0 {
+		s.writeError(w, r, http.StatusBadRequest, codeInvalidRequest, `missing "questions": at least one question is required`)
+		return
+	}
+	scope.questions = body.Questions.Len()
+
+	resolved, ok := s.resolveSettings(w, r, body.requestSettings)
+	if !ok {
+		return
+	}
+
+	evaluator, err := s.newEvaluator(resolved.settings)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -139,9 +189,9 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	resp, err := evaluator.Evaluate(r.Context(), classifier.Request{
 		State:       body.State,
 		Questions:   body.Questions,
-		Model:       model,
-		Temperature: temperature,
-		Mode:        mode,
+		Model:       resolved.model,
+		Temperature: resolved.temperature,
+		Mode:        resolved.mode,
 	})
 	if err != nil {
 		s.fail(w, r, err)

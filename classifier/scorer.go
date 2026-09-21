@@ -12,6 +12,16 @@ type ScoreRequest struct {
 	State string
 	// Statement is the proposition to judge.
 	Statement string
+	// Examples is the question's worked examples, already rendered as one
+	// labelled block by [ExamplesBlock], or empty when the question declares
+	// none. A backend puts it in the part of the prompt that does not change
+	// between candidates.
+	//
+	// It crosses the seam rendered rather than as []Example on purpose. Every
+	// candidate of one question is handed the same bytes, which is what lets a
+	// backend keep that part of the prompt identical across a whole wave, and
+	// a backend needs to know nothing about question types to place a string.
+	Examples string
 	// Temperature is the sampling temperature for the call.
 	Temperature float64
 }

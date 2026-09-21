@@ -11,8 +11,9 @@ The whole thing is standard library only — no third-party modules, in the
 service or in its tests.
 
 ```
-POST /api/evaluate      classify a state against declared questions
-GET  /api/health        liveness, plus the endpoint and model in use
+POST /api/evaluate        classify a state against declared questions
+POST /api/evaluate/batch  classify many states against one question set
+GET  /api/health          liveness, plus the endpoint and model in use
 ```
 
 ## How the parallel sampler works
@@ -155,10 +156,12 @@ comes up and rejects the requests that would need one with a 401.
 | `PERCEPTEA_API_KEY` | — | The key sent to that endpoint as a bearer token. The only variable a key is read from. |
 | `PERCEPTEA_MODEL` | `mistralai/Mistral-Small-24B-Instruct-2501` | The model id to score with. It has to be one the endpoint above serves, and it should be one that does not reason — see [Choosing a model](#choosing-a-model). |
 | `PERCEPTEA_REASONING_EFFORT` | — | Sent to the provider as `reasoning_effort`: `none`, `low`, `medium` or `high`. Unset sends no reasoning field at all. See [Choosing a model](#choosing-a-model). |
+| `PERCEPTEA_SCORER` | `chat` | How a probability is obtained: `chat` asks the model to write one, `logprob` reads it out of the first token's distribution. See [Two scorers](#two-scorers). |
 | `PERCEPTEA_TEMPERATURE` | `0` | Sampling temperature. 0 is the only reproducible setting. |
-| `PERCEPTEA_MAX_CONCURRENCY` | `8` | Scoring calls in flight per evaluation. |
-| `PERCEPTEA_REQUEST_TIMEOUT` | `60s` | Deadline for one request, end to end. |
-| `PERCEPTEA_MAX_BODY_BYTES` | `2097152` | Request body limit, 2 MiB. A state large enough to exceed it will not fit a model's context either. |
+| `PERCEPTEA_MAX_CONCURRENCY` | `8` | Scoring calls in flight per request. For `/api/evaluate` that is per evaluation; for `/api/evaluate/batch` it is the budget for the whole job, shared across every item, which is the point of that endpoint. |
+| `PERCEPTEA_MAX_BATCH_ITEMS` | `100` | The most states one `/api/evaluate/batch` request may carry. A batch fans out into items × candidates calls, so this is what stops a single request committing to an unbounded amount of provider spend. Over it is a `400`. |
+| `PERCEPTEA_REQUEST_TIMEOUT` | `60s` | Deadline for one request, end to end. A batch is one request, so a large one needs a larger deadline. |
+| `PERCEPTEA_MAX_BODY_BYTES` | `2097152` | Request body limit, 2 MiB, shared by both endpoints. A single state large enough to exceed it will not fit a model's context either. It is the batch endpoint that can reach it honestly — see [`POST /api/evaluate/batch`](#post-apievaluatebatch) for the arithmetic. |
 | `PERCEPTEA_ALLOW_REQUEST_CREDENTIALS` | `true` | Whether a request body may carry `api_key` and `inference_base_url`. **On, the service is an open proxy**: any caller can name an endpoint and have the service call it, on the server's key if they send none of their own. Right on a laptop; set it to `false` anywhere else. |
 | `PERCEPTEA_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `PERCEPTEA_LOG_FORMAT` | `text` | `text` or `json`. |
@@ -229,8 +232,8 @@ score of 4 and a noul is **9 calls**, not one. Every one of them re-sends the
 whole state, and every one of them asks for the same ten characters back:
 
 ```
-9 calls × (system prompt + state + one statement)   ← the bill
-9 × {"p": 0.87}                                     ← the output
+9 calls × (instruction + state + one statement)   ← the bill
+9 × {"p": 0.87}                                   ← the output
 ```
 
 So **input tokens dominate and output is about ten tokens per call.** A
@@ -239,6 +242,34 @@ nearly irrelevant here. Input price and latency are what you are buying, and
 latency matters twice over because the calls fan out: the request takes as
 long as the slowest wave of `PERCEPTEA_MAX_CONCURRENCY` calls, not as long as
 one.
+
+### The prompt is cut so its prefix can be cached
+
+Look at that bill again. Only the last few words of each call differ — the
+state is the same state nine times over. So the prompt is sent as two
+messages, cut exactly where the repetition stops:
+
+```
+message 1  the estimator instruction, the question's examples, the STATE
+           ← identical for every candidate of the question, byte for byte
+message 2  the one STATEMENT being judged, and the question to answer
+           ← a line or two, and the only part that changes
+```
+
+Most OpenAI-compatible endpoints cache a prompt **prefix** automatically and
+bill a matching one at a fraction of the input price. Nothing has to be asked
+for and no extra field is sent — a match is a match. What it needs is that the
+repeated part comes first and is exactly the same bytes, which is why nothing
+that varies by candidate is allowed into the first message.
+
+For the 9-candidate request that is 3 distinct prefixes instead of 9 whole
+prompts: the state is charged at full price once per question and at the
+cached rate for every candidate after the first. The saving grows with the
+state, which is the direction real states grow in — and with a long state and
+a wide choice, the prefix is nearly the whole bill.
+
+It is not free everywhere. An endpoint that does not cache simply sends the
+same tokens it always did, so the layout costs nothing where it gains nothing.
 
 ### Reasoning models are the trap
 
@@ -351,13 +382,15 @@ downgraded` at debug level.
 ### What it costs
 
 Take a 300-token state and the 9-candidate request above. Each call carries
-the system prompt, the state and one statement — call it 300 tokens — so the
+the instruction, the state and one statement — call it 300 tokens — so the
 request is roughly **2,700 input tokens and 90 output tokens**.
 
 At the default model's prices that is 2,700 × $0.050/M + 90 × $0.080/M ≈
 **$0.00014**, about a seventh of a tenth of a cent. A thousand requests is
 fourteen cents. Even the most expensive row above stays under a tenth of a
-cent per request.
+cent per request. That is the price with nothing cached; on an endpoint that
+does cache a matching prefix, most of those 2,700 input tokens are repeats of
+three prefixes and are billed at the cached rate.
 
 So cost is rarely the thing to optimise. **Reliability is**: a model that
 returns a readable probability every time is worth far more than one that
@@ -387,6 +420,46 @@ with a 400 — which would break every request against a provider that has
 never heard of it, to help with one that has. If your model only understands
 that switch, set it where the model is served, or use one that does not need
 it.
+
+### Two scorers
+
+`PERCEPTEA_SCORER` picks how a probability is obtained. `chat`, the default,
+asks the model to write one and parses `{"p": 0.87}` out of the reply.
+`logprob` asks the same statement as a one-word Yes or No, requests
+`logprobs`, and computes the answer from the first token's distribution:
+
+```
+P = exp(l_yes) / (exp(l_yes) + exp(l_no))
+```
+
+**Why you would switch.** A written probability is quantised by the model's
+writing habits: models emit 0.8, 0.9 and 0.95 and almost never 0.87, so the
+shape of a distribution is partly the shape of that habit. A logprob is
+continuous, and it is the estimate itself rather than a description of one.
+It also decodes one token instead of ten, which is most of the latency on a
+reply this short.
+
+**What it needs.** An endpoint *and* a model that accept `logprobs` and
+`top_logprobs` on a chat completion and return the top-k distribution. Not
+every endpoint does, some cap `top_logprobs` below the 20 asked for, and a
+gateway may strip the fields. Check yours before flipping the switch.
+
+**How it fails: loudly.** No logprobs is a `502 upstream_error` on
+`/api/evaluate`, naming the setting and the model — and on
+`/api/evaluate/batch` it is the same message on the failed item, with
+`error_code` `upstream_error`, because a batch is served whatever became of
+its items. It does not fall back to the chat scorer and it does not score a
+neutral 0.5 — for the same reason a truncated reply does not. A model that
+answers a Yes-or-No question with neither word fails the same way, and the
+error prints the tokens it offered instead. Both faults repeat on every
+candidate of every request, so a neutral score would turn the whole answer
+into a confident-looking uniform distribution.
+
+Two warnings. The scorers are **different estimators of the same quantity**,
+so thresholds and calibration do not transfer — re-run the benchmark when you
+switch. And a reasoning model is worse here than for the chat scorer: its one
+token is a thinking token, so pair `logprob` with
+`PERCEPTEA_REASONING_EFFORT=none` or a model that does not reason.
 
 ### One honest caveat
 
@@ -483,6 +556,157 @@ reliable. It also needs a backend that can do plain chat completions: the
 provider shipped here can, so only a `classifier.Scorer` of your own can run
 into that refusal.
 
+### `POST /api/evaluate/batch`
+
+Many states, one question set, one job.
+
+Classifying a hundred states over a hundred requests means a hundred
+independent fan-outs, each entitled to `PERCEPTEA_MAX_CONCURRENCY` calls of
+its own, all competing for the same provider. A batch is one fan-out:
+**every candidate of every item shares one concurrency budget**, so the load
+the provider sees is the limit you configured rather than the limit times the
+number of callers.
+
+```bash
+curl -s localhost:5301/api/evaluate/batch \
+  -H 'content-type: application/json' \
+  -d '{
+    "items": [
+      {"id": "t-1", "state": "Charged twice again!! Second month in a row."},
+      {"id": "t-2", "state": "Thanks, all sorted now."},
+      {"id": "t-3", "state": "The export button does nothing."}
+    ],
+    "questions": {
+      "department": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {
+          "billing": "Charges, refunds, invoices",
+          "technical": "Bugs or product issues",
+          "other": "Doesn'\''t fit"
+        }
+      },
+      "angry": {"type": "noul", "instructions": "Strong frustration or anger?"}
+    },
+    "mode": "parallel"
+  }'
+```
+
+```json
+{
+  "model": "mistralai/Mistral-Small-24B-Instruct-2501",
+  "results": [
+    {
+      "id": "t-1",
+      "index": 0,
+      "answers": {
+        "department": {"type": "choice", "choice": "billing", "confidence": 0.82,
+                       "probabilities": {"billing": 0.71, "technical": 0.12, "other": 0.17}},
+        "angry": {"type": "noul", "noul": 0.88}
+      },
+      "usage": {"input_tokens": 1180, "output_tokens": 32}
+    },
+    {
+      "id": "t-2",
+      "index": 1,
+      "answers": {
+        "department": {"type": "choice", "choice": "other", "confidence": 0.44,
+                       "probabilities": {"billing": 0.21, "technical": 0.24, "other": 0.55}},
+        "angry": {"type": "noul", "noul": 0.03}
+      },
+      "usage": {"input_tokens": 1104, "output_tokens": 32}
+    },
+    {
+      "id": "t-3",
+      "index": 2,
+      "answers": {},
+      "usage": {"input_tokens": 552, "output_tokens": 16},
+      "error": "upstream provider error (status 429): rate limit exceeded",
+      "error_code": "upstream_rate_limited"
+    }
+  ],
+  "usage": {"input_tokens": 2836, "output_tokens": 80},
+  "meta": {"mode": "parallel", "latency_ms": 2140, "parallel_calls": 12,
+           "items": 3, "succeeded": 2, "failed": 1}
+}
+```
+
+| Field | Required | What it is |
+|---|---|---|
+| `items` | yes | The states to classify. Each is `{"id": "...", "state": ...}`; `id` is yours and is echoed back, and `state` takes the same shapes it does on `/api/evaluate`. |
+| `questions` | yes | One question set, shared by every item and validated once. |
+| `model`, `temperature`, `mode`, `api_key`, `inference_base_url` | no | Exactly as on `/api/evaluate`, with the same rules. |
+
+**Results come back in request order**, each carrying its `index` and whatever
+`id` you sent, so they can be reassociated either way.
+
+**A failed item does not fail the batch.** The items are independent, so one
+state the provider refused gets its own `error` and the rest keep their
+answers — the opposite of a single evaluation, where the first error cancels
+the whole wave because every candidate there feeds one normalisation. A batch
+in which *every* item failed is still a `200`: the request was served, the
+items were not, and the results say which. What answers from the error table
+instead is anything that invalidates the whole request: no `items`, no
+`questions`, a question set that does not validate, an unknown mode, too many
+items, a body over the size limit, a key that could not be resolved (`401`),
+the evaluation outrunning `PERCEPTEA_REQUEST_TIMEOUT` (`504`), and the caller
+hanging up (`499`).
+
+**A failed item carries `error_code` beside its `error`**, from the same
+vocabulary the error table uses — `upstream_rate_limited`, `upstream_error`,
+`timeout`, `invalid_request`, `unsupported_mode` — so a per-item failure can
+be branched on the way a per-request one can, and a rate limit worth backing
+off from is tellable from a provider that is simply unwell. The `error`
+itself is the message `/api/evaluate` would have put in an error body for the
+same fault: a failure whose own text is the diagnosis says so, and one that
+never reached the provider says only that, because its text names the
+endpoint this server calls and the caller may not be allowed to know it. The
+detail goes to the log line instead.
+
+`meta.succeeded` and `meta.failed` let you tell a wholly successful batch from
+a partly successful one without walking the results. `usage` totals every
+item's, failed ones included: a call that failed late still cost what it cost.
+
+#### How big a batch can be
+
+Two limits apply, and they are different questions.
+
+`PERCEPTEA_MAX_BATCH_ITEMS` (default `100`) is about spend: a batch of *n*
+items against a question set with *c* candidates issues *n × c* calls under
+one request, so the ceiling is what stops one caller committing the server's
+key to an unbounded amount of it. The example above is 3 items × 4 candidates
+— three options plus a noul — so 12 were planned and `parallel_calls` reports
+12: all of them had been issued by the time the rate limit came back. The
+counter increments when a call is *issued*, not when it returns, so the
+rate-limited call counts itself, and so does the third item's fourth
+candidate, which was already in flight when its sibling failed and was
+cancelled there. `usage` counts what came back instead, which is why the
+failed item still reports the two candidates that answered before the rate
+limit did. Had the rate limit arrived sooner, a candidate still queued behind
+the concurrency budget would have been abandoned rather than issued and
+`parallel_calls` would be lower.
+
+`PERCEPTEA_MAX_BODY_BYTES` (default 2 MiB) is about the wire, and it is shared
+with `/api/evaluate` rather than raised for batches. The arithmetic: the
+question set is sent once, so 2 MiB across 100 items leaves roughly **21 KB
+per state**. Support tickets, reviews and log lines — what this service is
+for — run a few hundred bytes to a couple of kilobytes, so a full batch of
+them is 50–200 KB and nowhere near the limit. It binds only on states
+averaging over about 21 KB, which is some three and a half thousand words
+each; at that size the context window and the fan-out cost are the real
+constraints, not the body limit. So the default stands: raise
+`PERCEPTEA_MAX_BODY_BYTES` if you batch documents rather than messages, and
+leave it alone otherwise.
+
+The two limits answer differently, because they are found at different
+points. Too many items is a `400 invalid_request` naming
+`PERCEPTEA_MAX_BATCH_ITEMS`, the ceiling and the count you sent: the body was
+read and understood, and only then was it too big a job. A body over the byte
+limit is a `413 payload_too_large` naming the limit in bytes, because the
+read is cut short before there is a document to count items in — the item
+ceiling is this endpoint's, but the byte limit is shared with
+`/api/evaluate` and answers the same way there.
+
 ### `GET /api/health`
 
 ```bash
@@ -512,7 +736,7 @@ Every failure but one answers with the same body, so a client can branch on
 | Status | `code` | When |
 |---|---|---|
 | 400 | `invalid_json` | The body is not valid JSON, a question is malformed, a field is not one this endpoint takes, or something follows the JSON object. |
-| 400 | `invalid_request` | No `state`, no `questions`, a question the classifier rejects, or an `inference_base_url` that could never be called. |
+| 400 | `invalid_request` | No `state`, no `questions`, no `items`, more items than `PERCEPTEA_MAX_BATCH_ITEMS`, a question the classifier rejects, or an `inference_base_url` that could never be called. |
 | 400 | `unsupported_mode` | A mode that is not `parallel` or `oneshot`. (The provider shipped here can do both, so the "this provider cannot" half needs a backend of your own.) |
 | 401 | `missing_api_key` | No key could be resolved for the request. |
 | 404 | `not_found` | No such endpoint. |
@@ -528,6 +752,15 @@ A failure that is about the connection rather than the document — a body that
 timed out, a caller that went away — says nothing more on the wire: the
 underlying error names this server's own socket, so it goes to the log line
 instead.
+
+The table is for failures of the *request*. On `/api/evaluate/batch` an item
+that failed is not one of those: it answers `200` with the reason in that
+item's `error` and the code in its `error_code`. Both come from this same
+table — an item is told what a request would have been told, minus the
+status, which a served request has no second one of. The message is
+scrubbed of credentials like any other on its way out, and a failure this
+server cannot vouch for is reported as the same opaque upstream error a
+`502` carries, with its text kept for the log.
 
 ## Question types
 
@@ -568,6 +801,58 @@ No criteria. The answer is `noul`: the bare probability that the proposition
 holds, with no separate confidence, because the probability *is* the
 confidence. `"type": "boolean"` is accepted as a synonym on input and always
 reported back as `noul`.
+
+### `examples` — teach a question by demonstration
+
+Any question may carry `examples`: worked answers, each a state and the answer
+that was correct for it. They are optional, and a question that declares none
+produces exactly the prompt it would have produced without the field.
+
+```json
+{ "type": "choice",
+  "instructions": "Which team should handle this?",
+  "criteria": { "billing": "Charges, refunds, invoices", "technical": "Bugs" },
+  "examples": [
+    { "state": "I was charged twice for the Pro plan.", "answer": "billing" },
+    { "state": "The dashboard 500s on every load.",     "answer": "technical" }
+  ] }
+```
+
+`answer` is written in the question type's own terms, and is checked against
+the criteria before any call is made:
+
+| Type | `answer` | Rejected when |
+|---|---|---|
+| `choice` | an option key, as a string — `"billing"` | it is not one of the declared keys |
+| `score` | a level index, as a whole number — `2` | it is outside the declared scale |
+| `noul` / `boolean` | `true` or `false` | — (only the rule below) |
+
+**Every type rejects an example with no `answer`**, and `"answer": null`
+counts as none: `example 0 is missing "answer"`. The two are one omission and
+get one message. It is checked before the type-specific rule above rather
+than left to it, because only `choice` would have caught it — `null` decodes
+into a number and into a boolean without complaint and leaves the zero value,
+so a `score` example would teach level `0` and a `noul` example would teach
+`false`, neither of which the request said. `perceptea-bench` applies the
+same rule to a dataset line, where a fabricated label would be scored against
+rather than shown to the model.
+
+`state` takes the same shapes a request's own state does — a string, an object
+or an array — and is required on every example.
+
+Use them where the criteria alone leave a judgement call open: a borderline
+case, a label whose name reads more broadly than you mean it, two options a
+model keeps confusing. Two or three do most of the work.
+
+They are **shown once per question, not once per candidate**: they render into
+the part of the prompt that every candidate shares, so on an endpoint that
+caches a matching prefix they are paid for in full once and at the cached rate
+thereafter. They are still tokens, so keep each example's state short — an
+example is not the place for a full transcript.
+
+Examples belong to the parallel sampler, which is the default. `"mode":
+"oneshot"` builds one document from the instructions alone and does not show
+them.
 
 ## Using it as a library
 
@@ -653,6 +938,58 @@ zero-dependency claim at the top of this file is checked rather than trusted),
 `go vet`, `go build` and `go test -race` on every pull request, including
 from a fork, and on every push to `main`.
 
+## Measuring whether the probabilities mean anything
+
+Everything above is a claim about accuracy. `perceptea-bench` is how you check
+one:
+
+```bash
+go run ./cmd/perceptea-bench -dataset cmd/perceptea-bench/example.jsonl
+```
+
+It reads a labelled dataset, runs it through the classifier against your
+configured endpoint, and reports **Brier score**, **expected calibration
+error** over ten bins with the per-bin reliability table, **accuracy** for
+choice questions, **mean absolute error** for score questions, and
+**coverage** — how many cases ran and how many failed, because a benchmark
+that quietly evaluated 40 of 100 and reported a lovely number is worse than
+none.
+
+The dataset is JSON Lines, one labelled case per line, with the question in
+exactly the shape the API takes so a case can be lifted out of a request body:
+
+```json
+{"id":"refund-01","name":"intent","state":"I want my money back.",
+ "question":{"type":"choice","instructions":"Which intent is this?",
+             "criteria":{"refund":"Wants money back","support":"Wants help"}},
+ "answer":"refund"}
+```
+
+`answer` follows the question's type, the same way a worked example does: an
+option key, a level index, or true and false. A line that will not parse names
+its line number rather than being skipped.
+
+`-json` emits the same numbers as a document, with no timestamp and every
+statistic rounded, so two runs diff cleanly — which is the point. Reach for
+this before and after changing a model, a scorer or a prompt; without it, "the
+new one is better" is an opinion.
+
+**Interrupting a run does not throw it away.** Ctrl-C stops the dispatch,
+prints the report for the attempts that did finish, and exits non-zero saying
+how many there were: a hundred cases stopped at sixty measured sixty cases,
+and those cost real calls. The non-zero exit is what stops a script filing a
+partial document as a complete one.
+
+It needs a real key and makes real calls, so it is a tool rather than a test.
+`cmd/perceptea-bench/example.jsonl` is a runnable seven-case dataset covering
+all three question types. Everything else it needs comes from the same
+environment the server reads — the endpoint, the key, the model, the
+temperature, `PERCEPTEA_SCORER`, `PERCEPTEA_MAX_CONCURRENCY` and
+`PERCEPTEA_REQUEST_TIMEOUT` — so a benchmark measures the configuration you
+are actually serving. A credential carried in `PERCEPTEA_INFERENCE_BASE_URL`
+is struck out of any failure the report records, because the `-json` document
+is one you are being told to store and diff.
+
 ## Contributing
 
 Pull requests are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the
@@ -694,10 +1031,6 @@ nobody else, carries no such obligation.
   It is a boolean and there is no middle setting — a caller either names the
   endpoint or they do not. The service has no authentication of its own — put
   it behind something that does.
-- **A purpose-built classifier model would be faster and cheaper.** This is
-  ordinary chat models used as micro-scorers; its latency and calibration are
-  those of the model you point it at, and one call per candidate is a worse
-  deal than a model that scores the whole answer space in a single pass.
 - **A reasoning model cannot be used for `parallel` mode** unless its
   thinking can be turned off, because a scoring reply is capped at 32 tokens
   and thinking tokens exhaust it before the answer. The request fails with a

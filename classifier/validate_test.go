@@ -1,9 +1,12 @@
 package classifier
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -14,6 +17,16 @@ func choiceWith(n int) Question {
 		options.Set(fmt.Sprintf("option-%d", i), "")
 	}
 	return Question{Type: TypeChoice, Options: *options}
+}
+
+// optionsOf builds an option map from the given keys, each with a description
+// derived from its key so that nothing depends on a blank one.
+func optionsOf(keys ...string) *OrderedMap[string] {
+	options := NewOrderedMap[string]()
+	for _, key := range keys {
+		options.Set(key, "The "+key+" team")
+	}
+	return options
 }
 
 // levelsOf builds a score question with n generated level labels.
@@ -59,6 +72,31 @@ func TestValidateAccepts(t *testing.T) {
 				"department": {"type": "choice", "criteria": {"billing": "Charges", "technical": "Bugs"}},
 				"urgency": {"type": "score", "criteria": ["Low", "High"]},
 				"angry": {"type": "noul"}
+			}`),
+		},
+		{
+			name: "worked examples answering in each type's own terms",
+			qs: mustQuestions(t, `{
+				"department": {
+					"type": "choice",
+					"criteria": {"billing": "Charges", "technical": "Bugs"},
+					"examples": [
+						{"state": "charged twice", "answer": "billing"},
+						{"state": "a 500 on every load", "answer": "technical"}
+					]
+				},
+				"urgency": {
+					"type": "score",
+					"criteria": ["Low", "Medium", "High"],
+					"examples": [
+						{"state": "no rush", "answer": 0},
+						{"state": "launch in an hour", "answer": 2}
+					]
+				},
+				"angry": {
+					"type": "boolean",
+					"examples": [{"state": "thanks!", "answer": false}]
+				}
 			}`),
 		},
 	}
@@ -148,6 +186,107 @@ func TestValidateRejects(t *testing.T) {
 			wantField:    "criteria",
 			wantMessage:  "level 1 has an empty label",
 		},
+		// A bad example is caught here rather than at prompt-building time.
+		// It is shown to the model on every call of the wave, so an example
+		// naming an answer the question could not give is wrong many times
+		// over, and cheapest to reject before the first call.
+		{
+			name: "a choice example answering with an undeclared option key",
+			qs: one("department", Question{
+				Type:     TypeChoice,
+				Options:  *optionsOf("billing", "technical"),
+				Examples: []Example{{State: StringState("charged twice"), Choice: "sales"}},
+			}),
+			wantQuestion: "department",
+			wantField:    "examples",
+			wantMessage:  `example 0 answers "sales", which is not one of the declared option keys`,
+		},
+		{
+			name: "a choice example answering with no option key at all",
+			qs: one("department", Question{
+				Type:    TypeChoice,
+				Options: *optionsOf("billing"),
+				Examples: []Example{
+					{State: StringState("charged twice"), Choice: "billing"},
+					{State: StringState("a 500 on every load")},
+				},
+			}),
+			wantQuestion: "department",
+			wantField:    "examples",
+			wantMessage:  `example 1 answers "", which is not one of the declared option keys`,
+		},
+		{
+			name: "a score example answering off the end of the scale",
+			qs: one("urgency", Question{
+				Type:     TypeScore,
+				Levels:   []string{"Low", "Medium", "High"},
+				Examples: []Example{{State: StringState("launch in an hour"), Level: 3}},
+			}),
+			wantQuestion: "urgency",
+			wantField:    "examples",
+			wantMessage:  "example 0 answers with level 3, outside the declared scale of 3 levels (0 to 2)",
+		},
+		{
+			name: "a score example answering with a negative level",
+			qs: one("urgency", Question{
+				Type:     TypeScore,
+				Levels:   []string{"Low", "High"},
+				Examples: []Example{{State: StringState("no rush"), Level: -1}},
+			}),
+			wantQuestion: "urgency",
+			wantField:    "examples",
+			wantMessage:  "example 0 answers with level -1, outside the declared scale of 2 levels (0 to 1)",
+		},
+		{
+			name: "an example with no state",
+			qs: one("angry", Question{
+				Type:     TypeNoul,
+				Examples: []Example{{Noul: true}},
+			}),
+			wantQuestion: "angry",
+			wantField:    "examples",
+			wantMessage:  "example 0 has no state",
+		},
+		{
+			name: "an example with no state on a choice question",
+			qs: one("department", Question{
+				Type:     TypeChoice,
+				Options:  *optionsOf("billing"),
+				Examples: []Example{{Choice: "billing"}},
+			}),
+			wantQuestion: "department",
+			wantField:    "examples",
+			wantMessage:  "example 0 has no state",
+		},
+		// An example whose state is present but not renderable is the one
+		// fault that used to survive Validate: it has bytes, so it is not
+		// zero, and nothing tried to render them until the prompt was being
+		// built — where the failure is a plain error with no question name
+		// on it and no way for a caller to tell it from an upstream one.
+		{
+			name: "an example whose state is not valid JSON",
+			qs: one("angry", Question{
+				Type:     TypeNoul,
+				Examples: []Example{{State: RawState(json.RawMessage(`{"broken":`)), Noul: true}},
+			}),
+			wantQuestion: "angry",
+			wantField:    "examples",
+			wantMessage:  "example 0 has a state that cannot be rendered",
+		},
+		{
+			name: "an example whose state is not valid JSON on a choice question",
+			qs: one("department", Question{
+				Type:    TypeChoice,
+				Options: *optionsOf("billing"),
+				Examples: []Example{
+					{State: StringState("charged twice"), Choice: "billing"},
+					{State: RawState(json.RawMessage(`[1,`)), Choice: "billing"},
+				},
+			}),
+			wantQuestion: "department",
+			wantField:    "examples",
+			wantMessage:  "example 1 has a state that cannot be rendered",
+		},
 		{
 			name:         "an unknown question type",
 			qs:           one("ranking", Question{Type: "ranking"}),
@@ -207,6 +346,98 @@ func TestValidateReportsTheFirstProblemInOrder(t *testing.T) {
 	}
 	if verr.Question != "urgency" {
 		t.Fatalf("reported question %q, want the first invalid one, %q", verr.Question, "urgency")
+	}
+}
+
+// A question whose criteria and whose example are both wrong reports the
+// criteria. An example answers in the criteria's terms, so there is nothing
+// worth saying about it until the criteria themselves hold up.
+func TestCriteriaAreReportedBeforeExamples(t *testing.T) {
+	qs := one("urgency", Question{
+		Type:     TypeScore,
+		Levels:   []string{"Low"},
+		Examples: []Example{{State: StringState("no rush"), Level: 9}},
+	})
+
+	var verr *ValidationError
+	if err := Validate(qs); !errors.As(err, &verr) {
+		t.Fatalf("Validate returned %v, want a *ValidationError", err)
+	}
+	if verr.Field != "criteria" {
+		t.Errorf("Field = %q, want criteria; the message was %q", verr.Field, verr.Message)
+	}
+}
+
+// A bad example costs nothing to find and is shown to the model on every call
+// of the wave, so it is found before the wave starts rather than after a
+// provider has been paid to read it.
+func TestABadExampleIsRejectedBeforeAnyCallIsMade(t *testing.T) {
+	var calls atomic.Int64
+	e := New(ScorerFunc(func(context.Context, ScoreRequest) (ScoreResult, error) {
+		calls.Add(1)
+		return ScoreResult{Probability: 0.5}, nil
+	}))
+
+	qs := mustQuestions(t, `{"department": {
+		"type": "choice",
+		"criteria": {"billing": "Charges", "technical": "Bugs"},
+		"examples": [{"state": "charged twice", "answer": "sales"}]
+	}}`)
+
+	_, err := e.Evaluate(context.Background(), Request{State: StringState("charged twice"), Questions: qs})
+	var verr *ValidationError
+	// Not a Fatal: the count below is the other half of the claim, and it is
+	// worth reporting even once the error has gone wrong.
+	if !errors.As(err, &verr) {
+		t.Errorf("Evaluate returned %v, want a *ValidationError", err)
+	} else if verr.Field != "examples" {
+		t.Errorf("Field = %q, want examples", verr.Field)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("the scorer was called %d times; a request with a bad example must not reach a provider", n)
+	}
+}
+
+// The same claim for the fault that used to get past [Validate] and fail
+// inside the renderer instead. A caller reaching Evaluate with it got a plain
+// error: no *ValidationError to inspect, no question named, and — alone in
+// this package — no "classifier:" on the front of it.
+func TestAnUnrenderableExampleStateIsAValidationErrorFromEvaluate(t *testing.T) {
+	var calls atomic.Int64
+	e := New(ScorerFunc(func(context.Context, ScoreRequest) (ScoreResult, error) {
+		calls.Add(1)
+		return ScoreResult{Probability: 0.5}, nil
+	}))
+
+	// Only a programmatically built state can be this: the wire decoder would
+	// have rejected the bytes on the way in.
+	qs := one("angry", Question{
+		Type:     TypeNoul,
+		Examples: []Example{{State: RawState(json.RawMessage(`{"broken":`)), Noul: true}},
+	})
+
+	_, err := e.Evaluate(context.Background(), Request{State: StringState("s"), Questions: qs})
+	var verr *ValidationError
+	if !errors.As(err, &verr) {
+		t.Errorf("Evaluate returned %T (%v), want a *ValidationError", err, err)
+	} else if verr.Question != "angry" || verr.Field != "examples" {
+		t.Errorf("validation error named %q/%q, want angry/examples", verr.Question, verr.Field)
+	}
+	if err != nil && !strings.HasPrefix(err.Error(), "classifier:") {
+		t.Errorf("error %q does not start with the package's prefix", err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("the scorer was called %d times; a question whose examples cannot be rendered must not reach a provider", n)
+	}
+
+	// A batch shares the question set, so the same fault fails the request
+	// rather than each of its items separately.
+	_, berr := e.EvaluateBatch(context.Background(), BatchRequest{
+		Items:     []BatchItem{{ID: "t-0", State: StringState("s")}},
+		Questions: qs,
+	})
+	if !errors.As(berr, &verr) {
+		t.Errorf("EvaluateBatch returned %T (%v), want a *ValidationError", berr, berr)
 	}
 }
 

@@ -46,6 +46,22 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
+      # A package that is not in the repository makes `go build ./...`
+      # quieter, not louder: it passes because there is nothing to compile.
+      # cmd/perceptea was missing from git for weeks behind an ignore rule
+      # meant for the built binary, and every gate stayed green.
+      #
+      # Asked directly -- is every Go file tracked? -- rather than through
+      # `git status --ignored`, which collapses a wholly ignored directory to
+      # its own name and so never mentions the files that went missing.
+      - name: every Go file is tracked
+        run: |
+          untracked=$(find . -name '*.go' -not -path './.git/*' -print0 |
+            xargs -0 -n1 sh -c 'git ls-files --error-unmatch "$0" >/dev/null 2>&1 || echo "$0"')
+          if [ -n "$untracked" ]; then
+            echo "these Go files are not in the repository:"; echo "$untracked"; exit 1
+          fi
+
       - name: go vet
         run: go vet ./...
 

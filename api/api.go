@@ -46,6 +46,13 @@ type Settings struct {
 	// every call, or empty to send none. It comes from the server's
 	// configuration and from nowhere else: a request body cannot name one.
 	ReasoningEffort string
+	// Scorer names how the provider client obtains a probability: writing
+	// one as JSON, or reading it out of the first token's logprobs. Like
+	// ReasoningEffort it is the operator's choice and a request body cannot
+	// name one — the two scorers are different estimators of the same
+	// quantity, so letting a caller switch would change what a threshold
+	// means from one request to the next.
+	Scorer string
 	// MaxConcurrency bounds the scoring calls one evaluation runs at once.
 	MaxConcurrency int
 }
@@ -83,6 +90,26 @@ func NewServer(opts Options) (*Server, error) {
 	if cfg.MaxBodyBytes < 1 {
 		cfg.MaxBodyBytes = config.DefaultMaxBodyBytes
 	}
+	if cfg.MaxBatchItems < 1 {
+		cfg.MaxBatchItems = config.DefaultMaxBatchItems
+	}
+	// The scorer is not a limit and cannot be normalised the way the four
+	// above are: the two scorers are different estimators of the same
+	// quantity, so quietly reading an unrecognised word as one of them would
+	// answer every request with numbers from the estimator whoever wrote it
+	// had just decided not to use. Absent is not a choice and takes the
+	// default like everything else here; a word this server does not know
+	// stops it starting, as every other malformed setting does. Left to the
+	// provider factory it was a generic 500 on every request, with
+	// /api/health still reporting ok.
+	switch cfg.Scorer {
+	case "":
+		cfg.Scorer = config.DefaultScorer
+	case config.ScorerChat, config.ScorerLogprob:
+	default:
+		return nil, fmt.Errorf("%s: %q is not a scorer; expected %q or %q",
+			config.EnvScorer, cfg.Scorer, config.ScorerChat, config.ScorerLogprob)
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -107,6 +134,12 @@ func NewServer(opts Options) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/evaluate", s.handleEvaluate)
 	mux.HandleFunc("/api/evaluate", s.methodNotAllowed(http.MethodPost))
+	// A longer literal pattern wins over a shorter one, so the batch path is
+	// matched by its own handlers and never by /api/evaluate's or the "/"
+	// catch-all's. Anything below it — /api/evaluate/batch/more — matches
+	// neither and still 404s.
+	mux.HandleFunc("POST /api/evaluate/batch", s.handleBatchEvaluate)
+	mux.HandleFunc("/api/evaluate/batch", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("/api/health", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/", s.handleNotFound)
@@ -143,7 +176,11 @@ func (s *Server) Handler() http.Handler { return s.handler }
 // requestScope carries what the log line needs, but only the handler knows.
 type requestScope struct {
 	questions int
-	mode      string
+	// items is how many states a batch carried, and zero for the endpoints
+	// that take one. Without it a hundred-state batch logs exactly like a
+	// single evaluation of the same questions.
+	items int
+	mode  string
 	// secret is the API key resolved for this request, so that it can be
 	// scrubbed from anything on its way out.
 	secret string
@@ -242,6 +279,9 @@ func (s *Server) logRequest(ctx context.Context, r *http.Request, rec *statusRec
 	}
 	if scope.questions > 0 {
 		attrs = append(attrs, slog.Int("questions", scope.questions))
+	}
+	if scope.items > 0 {
+		attrs = append(attrs, slog.Int("items", scope.items))
 	}
 	if scope.mode != "" {
 		attrs = append(attrs, slog.String("mode", scope.mode))

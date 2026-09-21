@@ -5,7 +5,11 @@
 # Build output
 /bin/
 /dist/
-perceptea
+# The built binary at the repository root, and only that: a bare "perceptea"
+# also matches the cmd/perceptea directory, which silently kept the service's
+# entrypoint out of git while `go build ./...` passed because the package was
+# not there to fail.
+/perceptea
 
 # Go
 *.test

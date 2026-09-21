@@ -22,11 +22,43 @@ import (
 // distinctive enough to grep for.
 const testKey = "sk-server-0123456789abcdef"
 
-// evaluateFunc adapts a function to the Evaluator interface.
+// evaluateFunc adapts a function to the Evaluator interface. It deliberately
+// implements nothing else, so it also stands in for an evaluator that cannot
+// serve a batch.
 type evaluateFunc func(context.Context, classifier.Request) (classifier.Response, error)
 
 func (f evaluateFunc) Evaluate(ctx context.Context, req classifier.Request) (classifier.Response, error) {
 	return f(ctx, req)
+}
+
+// batchFunc is what the fake does when a batch is asked for.
+type batchFunc func(context.Context, classifier.BatchRequest) (classifier.BatchResponse, error)
+
+// fakeEvaluator is what the harness puts on the other side of
+// Options.NewEvaluator. It answers both endpoints, because the real evaluator
+// does; every call is recorded on the harness that made it.
+type fakeEvaluator struct{ h *harness }
+
+func (f *fakeEvaluator) Evaluate(ctx context.Context, req classifier.Request) (classifier.Response, error) {
+	f.h.mu.Lock()
+	f.h.seenRequests = append(f.h.seenRequests, req)
+	fn := f.h.evaluate
+	f.h.mu.Unlock()
+	if fn == nil {
+		return classifier.Response{}, nil
+	}
+	return fn(ctx, req)
+}
+
+func (f *fakeEvaluator) EvaluateBatch(ctx context.Context, req classifier.BatchRequest) (classifier.BatchResponse, error) {
+	f.h.mu.Lock()
+	f.h.seenBatches = append(f.h.seenBatches, req)
+	fn := f.h.evaluateBatch
+	f.h.mu.Unlock()
+	if fn == nil {
+		return classifier.BatchResponse{}, nil
+	}
+	return fn(ctx, req)
 }
 
 // harness is a server wired to a fake evaluator and a logger that writes to a
@@ -41,11 +73,18 @@ type harness struct {
 	// evaluate is what the fake evaluator does. Nil answers with an empty
 	// response.
 	evaluate evaluateFunc
+	// evaluateBatch is what it does with a batch. Nil answers with an empty
+	// response.
+	evaluateBatch batchFunc
 	// factoryErr, when set, fails NewEvaluator instead of building one.
 	factoryErr error
+	// singleOnly builds an evaluator that cannot serve a batch, which is what
+	// a server wired to some other implementation would have.
+	singleOnly bool
 	// seen records what the server asked for, in order.
 	seenSettings []Settings
 	seenRequests []classifier.Request
+	seenBatches  []classifier.BatchRequest
 }
 
 // newHarness builds a server from the default test configuration, after tweak
@@ -80,20 +119,18 @@ func newHarness(t *testing.T, tweak func(*config.Config)) *harness {
 			h.mu.Lock()
 			h.seenSettings = append(h.seenSettings, st)
 			failWith := h.factoryErr
+			singleOnly := h.singleOnly
 			h.mu.Unlock()
 			if failWith != nil {
 				return nil, failWith
 			}
-			return evaluateFunc(func(ctx context.Context, req classifier.Request) (classifier.Response, error) {
-				h.mu.Lock()
-				h.seenRequests = append(h.seenRequests, req)
-				fn := h.evaluate
-				h.mu.Unlock()
-				if fn == nil {
-					return classifier.Response{}, nil
-				}
-				return fn(ctx, req)
-			}), nil
+			fake := &fakeEvaluator{h: h}
+			if singleOnly {
+				// A method value behind a func type: it records exactly as the
+				// struct does but implements Evaluator and nothing more.
+				return evaluateFunc(fake.Evaluate), nil
+			}
+			return fake, nil
 		},
 	})
 	if err != nil {
@@ -463,7 +500,15 @@ func TestUnknownPathIs404(t *testing.T) {
 	// listing the endpoint presets that configuration no longer has, and a
 	// route that used to exist is the one an editor is most likely to restore
 	// by reflex. It must 404 like any other unknown path.
-	for _, path := range []string{"/api/nope", "/", "/api/evaluate/extra", "/api/meta", "/api/models", "/api/providers"} {
+	//
+	// "/api/evaluate/extra" and "/api/evaluate/batch/extra" are the other
+	// reason this list is worth keeping: /api/evaluate/batch is a path below
+	// a path, and a pattern written with a trailing slash would turn either
+	// of those into a silent 200 against the wrong handler.
+	for _, path := range []string{
+		"/api/nope", "/", "/api/evaluate/extra", "/api/evaluate/batch/extra",
+		"/api/meta", "/api/models", "/api/providers",
+	} {
 		for _, method := range []string{http.MethodGet, http.MethodPost} {
 			w := h.send(httptest.NewRequest(method, path, strings.NewReader("")))
 			h.expectError(w, http.StatusNotFound, "not_found")

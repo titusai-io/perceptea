@@ -2,7 +2,7 @@
 #
 # Open in VS Code (REST Client extension) or a JetBrains IDE and click Send on
 # any request. Everything below is a real, runnable example of the three
-# question types.
+# question types, and of the worked examples any of them may carry.
 #
 # Start the service first. DeepInfra and mistralai/Mistral-Small-24B-Instruct-2501
 # are already the defaults, so a key is the only thing it needs:
@@ -225,6 +225,89 @@ Content-Type: application/json
 
 
 ###############################################################################
+# 4. examples — teaching a question by demonstration
+#
+# Any question may carry worked examples: a state, and the answer that was
+# correct for it. They go where the criteria alone leave a judgement call
+# open — a borderline case, a label that reads more broadly than you mean it,
+# two options the model keeps confusing.
+#
+# The answer is written in the question type's own terms: an option key for a
+# choice, a level index for a score, true or false for a noul. A wrong one is
+# a 400 before any upstream call is made.
+#
+# They are shown once per question rather than once per candidate, in the part
+# of the prompt every candidate of that question shares, so an endpoint that
+# caches a matching prompt prefix charges for them once.
+###############################################################################
+
+### examples — a choice whose two options are easy to confuse
+# "billing" and "account" both fit a payment problem that locked someone out.
+# Two worked answers say which way to read it.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "My card was declined on renewal and now I can't log in at all.",
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "billing":   "Charges, refunds, invoices",
+        "technical": "Bugs or product issues",
+        "account":   "Login or access problems",
+        "other":     "Does not fit the above"
+      },
+      "examples": [
+        { "state": "I was charged twice for the Pro plan.", "answer": "billing" },
+        { "state": "The dashboard 500s on every load.", "answer": "technical" },
+        { "state": "Payment failed and my seat was suspended — let me back in.", "answer": "billing" }
+      ]
+    }
+  }
+}
+
+### examples — anchoring a score scale to what the levels actually mean
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "Heads up: a couple of the icons look blurry on a retina screen. No rush.",
+  "questions": {
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this?",
+      "criteria": ["Low", "Medium", "High", "Critical"],
+      "examples": [
+        { "state": "Whenever you get to it, no deadline here.", "answer": 0 },
+        { "state": "We are fully down and every customer is affected.", "answer": 3 }
+      ]
+    }
+  }
+}
+
+### examples — a noul, with a structured state
+# An example's state takes the same shapes a request's own state does.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": { "subject": "Still waiting", "message": "Any update on the ticket from Tuesday?" },
+  "questions": {
+    "angry": {
+      "type": "noul",
+      "instructions": "The customer is expressing strong frustration or anger",
+      "examples": [
+        { "state": { "subject": "Thanks!", "message": "Sorted, appreciate the quick fix." }, "answer": false },
+        { "state": { "subject": "Charged twice AGAIN", "message": "Third month running. Fix it or I am cancelling." }, "answer": true }
+      ]
+    }
+  }
+}
+
+
+###############################################################################
 # All three at once
 #
 # Questions run concurrently, and so do the candidates within each. This one
@@ -262,6 +345,86 @@ Content-Type: application/json
       "instructions": "The customer is expressing strong frustration or anger"
     }
   }
+}
+
+
+###############################################################################
+# 5. batch — many states, one question set, one fan-out
+#
+# Sending these three states to /api/evaluate one at a time would be three
+# requests, each entitled to PERCEPTEA_MAX_CONCURRENCY calls of its own, all
+# competing for the same provider. As one batch it is a single wave: every
+# candidate of every item shares one budget.
+#
+# Results come back in request order, each with its index and the id you sent.
+# This one issues 3 items x (3 + 1) candidates = 12 upstream calls — check
+# meta.parallel_calls, and meta.succeeded / meta.failed, in the response.
+#
+# At most PERCEPTEA_MAX_BATCH_ITEMS states per request (100 by default).
+###############################################################################
+
+### batch — three tickets, one question set
+POST {{host}}/api/evaluate/batch
+Content-Type: application/json
+
+{
+  "items": [
+    { "id": "t-1", "state": "This is the SECOND month in a row I've been billed twice for the Pro plan. Fix it ASAP." },
+    { "id": "t-2", "state": "Thanks for sorting that out yesterday — all good now." },
+    { "id": "t-3", "state": "The export button does nothing when I click it in Safari." }
+  ],
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "billing":   "Charges, refunds, invoices",
+        "technical": "Bugs or product issues",
+        "other":     "Does not fit the above"
+      }
+    },
+    "angry": {
+      "type": "noul",
+      "instructions": "The customer is expressing strong frustration or anger"
+    }
+  }
+}
+
+### batch — a partial failure: 200, with the failed item saying why
+# One item that cannot be evaluated does not discard the ones that can. Here
+# the middle item has no state to ask the questions about, so it comes back
+# with an "error" and no answers while its neighbours come back answered —
+# and the response is still a 200, because the request was served even though
+# that item was not. Only a whole-request fault (no items, no questions, too
+# many items) uses the error body.
+#
+# Look for: results[1].error set, results[0] and results[2] answered,
+# meta.succeeded 2 and meta.failed 1.
+POST {{host}}/api/evaluate/batch
+Content-Type: application/json
+
+{
+  "items": [
+    { "id": "ok-before", "state": "Billed twice again this month." },
+    { "id": "no-state",  "state": null },
+    { "id": "ok-after",  "state": "The export button does nothing." }
+  ],
+  "questions": {
+    "angry": {
+      "type": "noul",
+      "instructions": "The customer is expressing strong frustration or anger"
+    }
+  }
+}
+
+### batch — an empty item list: 400 invalid_request
+# The other half of the rule above. Nothing was asked, so nothing was served.
+POST {{host}}/api/evaluate/batch
+Content-Type: application/json
+
+{
+  "items": [],
+  "questions": { "angry": { "type": "noul", "instructions": "The customer is angry" } }
 }
 
 
@@ -366,6 +529,38 @@ Content-Type: application/json
   "state": "anything",
   "questions": {
     "urgency": { "type": "score", "instructions": "How urgent?", "criteria": ["Urgent"] }
+  }
+}
+
+### An example answering with an undeclared option key — 400 invalid_request
+# An example is shown on every call of the wave, so a wrong one is wrong many
+# times over. It is checked against the criteria before the first call.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "anything",
+  "questions": {
+    "department": {
+      "type": "choice",
+      "criteria": { "billing": "Charges", "technical": "Bugs" },
+      "examples": [{ "state": "charged twice", "answer": "sales" }]
+    }
+  }
+}
+
+### An example answering off the end of a score scale — 400 invalid_request
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "anything",
+  "questions": {
+    "urgency": {
+      "type": "score",
+      "criteria": ["Low", "Medium", "High"],
+      "examples": [{ "state": "launch in an hour", "answer": 3 }]
+    }
   }
 }
 

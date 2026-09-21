@@ -15,17 +15,85 @@ import (
 	"github.com/titusai-io/perceptea/classifier"
 )
 
-// scoreSystemPrompt is the calibrated-estimator instruction every scoring call
-// is made under. The probabilities a model returns are calibrated against this
-// exact wording, so editing it moves the numbers.
-const scoreSystemPrompt = "You are a calibrated probability estimator. " +
+// scoreInstruction is the calibrated-estimator instruction every scoring call
+// is made under, and the first thing in the prompt. The probabilities a model
+// returns are calibrated against this exact wording, so editing it moves the
+// numbers.
+const scoreInstruction = "You are a calibrated probability estimator. " +
 	"Given a STATE and a STATEMENT, return only how likely the statement is true " +
 	"based solely on the state. Do not invent facts. " +
 	`Respond with JSON: {"p": <number 0 to 1>}.`
 
+// scoreStateLabel and scoreStatementLabel introduce the two things the
+// instruction names.
+const (
+	scoreStateLabel     = "STATE:\n"
+	scoreStatementLabel = "STATEMENT:\n"
+)
+
 // scoreUserSuffix closes the user turn. The dash is an en dash (U+2013), not a
 // hyphen; changing it changes the prompt, and so the probabilities.
 const scoreUserSuffix = "\n\nHow likely is the statement true (0–1)?"
+
+// The prompt is cut into two messages, and where the cut falls is the whole
+// point of the shape.
+//
+// The first message is the prefix: the estimator instruction, the question's
+// worked examples when it declares any, and the state. Every candidate answer
+// of one question is judged against exactly those three, so the prefix is
+// byte-identical for the whole wave — a choice of four, a score of four and a
+// noul are nine calls and three prefixes, each sent several times over — and
+// an endpoint that caches a matching prompt prefix serves the repeats from the
+// cache. Only the suffix is then new work.
+//
+// Nothing that varies by candidate may go in the prefix. One index, one count,
+// one reordering and every call diverges at its first differing token; there
+// is no error, no warning and no symptom except the bill, which is why a test
+// asserts the bytes rather than the intent.
+//
+// The second message is the suffix, and holds what changes: the one statement
+// being judged and the question to answer about it.
+//
+// No cache-control field is sent with any of it. Prefix caching on these
+// endpoints happens automatically on a prefix match, and a field an endpoint
+// has never heard of is one more thing for it to reject.
+
+// promptPrefix renders the half of the prompt every candidate of one question
+// shares: an instruction, the question's examples when it declares any, and
+// the state. Both scorers build their prefix with it and differ only in the
+// instruction they pass, so the layout — and the caching property that depends
+// on it — cannot drift between them.
+//
+// The examples arrive already rendered as one labelled block. The tempting
+// alternative is to stage each of them as a prior exchange — a user turn
+// putting an example's statement, an assistant turn answering {"p": 0.95} —
+// and it cannot be used here: a statement belongs to one candidate, so
+// examples written that way differ on every call of the wave and there is no
+// shared prefix left to cache. A labelled block teaches the same thing and
+// stays identical across the wave.
+func promptPrefix(instruction, examples, state string) string {
+	var b strings.Builder
+	b.WriteString(instruction)
+	b.WriteString("\n\n")
+	if strings.TrimSpace(examples) != "" {
+		b.WriteString(examples)
+		b.WriteString("\n\n")
+	}
+	b.WriteString(scoreStateLabel)
+	b.WriteString(state)
+	return b.String()
+}
+
+// scorePrefix renders the chat scorer's shared prefix.
+func scorePrefix(examples, state string) string {
+	return promptPrefix(scoreInstruction, examples, state)
+}
+
+// scoreSuffix renders the half that changes: this one candidate's statement
+// and the question about it.
+func scoreSuffix(statement string) string {
+	return scoreStatementLabel + statement + scoreUserSuffix
+}
 
 // maxScoreTokens caps the reply. The answer is a handful of characters; the
 // cap is what keeps a chatty model from turning one score into an essay.
@@ -66,8 +134,25 @@ var scoreSchema = json.RawMessage(
 // fraction or bare 0/1 in a reply that is not JSON.
 var probabilityPattern = regexp.MustCompile(`0?\.\d+|[01](?:\.0+)?`)
 
-// Score asks the model how likely one statement is, given one state, and
-// returns the probability with the tokens it cost.
+// Score asks how likely one statement is, given one state, and returns the
+// probability with the tokens it cost.
+//
+// Which of the two scorers answers is fixed when the client is built, by
+// Config.Scorer: the chat scorer by default, and the logprob scorer when the
+// client was configured for it. The package doc and Config.Scorer describe
+// the difference between them; everything documented below is the first.
+func (c *Client) Score(ctx context.Context, req classifier.ScoreRequest) (classifier.ScoreResult, error) {
+	if c.scorer == scorerLogprob {
+		return c.scoreByLogprob(ctx, req)
+	}
+	return c.scoreByChat(ctx, req)
+}
+
+// scoreByChat asks the model to write a probability and reads the number out
+// of what it wrote.
+//
+// The prompt goes out as a shared prefix and a per-candidate suffix; see the
+// note above [promptPrefix] for what may go in which, and why it matters.
 //
 // The call starts at the client's current structured-output level and steps
 // down a level whenever the provider rejects the request shape, so a provider
@@ -86,15 +171,20 @@ var probabilityPattern = regexp.MustCompile(`0?\.\d+|[01](?:\.0+)?`)
 // degrade to 0.5 rather than returning an error. The exception is a reply that
 // was cut off at the output token limit and carried no probability, which
 // returns [ErrTruncatedReply]: see there for why that one is not forgiven.
-func (c *Client) Score(ctx context.Context, req classifier.ScoreRequest) (classifier.ScoreResult, error) {
+func (c *Client) scoreByChat(ctx context.Context, req classifier.ScoreRequest) (classifier.ScoreResult, error) {
 	model, err := c.resolveModel(req.Model)
 	if err != nil {
 		return classifier.ScoreResult{}, err
 	}
 
+	// Two messages, prefix then suffix; see the note above scorePrefix for
+	// why the cut falls where it does. The prefix is the system turn and the
+	// suffix the user turn, which keeps the exchange to the one shape every
+	// endpoint accepts: a chat template that insists its roles alternate
+	// would reject two user turns in a row.
 	messages := []chatMessage{
-		{Role: "system", Content: scoreSystemPrompt},
-		{Role: "user", Content: "STATE:\n" + req.State + "\n\nSTATEMENT:\n" + req.Statement + scoreUserSuffix},
+		{Role: "system", Content: scorePrefix(req.Examples, req.State)},
+		{Role: "user", Content: scoreSuffix(req.Statement)},
 	}
 
 	started := c.outputLevel()
@@ -201,10 +291,18 @@ func truncatedScoreError(choice chatChoice) error {
 // The configuration this package's errors point at. They are spelled out
 // rather than imported: a provider client is usable on its own, and must not
 // depend on the server that happens to configure it. A test asserts that
-// they still match the setting the server actually reads.
+// they still match the settings the server actually reads.
 const (
 	envReasoningEffort = "PERCEPTEA_REASONING_EFFORT"
 	effortNone         = "none"
+
+	// envScorer is the setting that picks between the two scorers, and
+	// scorerChat and scorerLogprob are the two values it takes. They are
+	// also the values [Config.Scorer] itself takes, so the same two
+	// spellings serve the library caller and the operator reading an error.
+	envScorer     = "PERCEPTEA_SCORER"
+	scorerChat    = "chat"
+	scorerLogprob = "logprob"
 )
 
 // probabilityFrom reads a probability out of a model reply, forgivingly and in
