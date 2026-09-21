@@ -200,24 +200,35 @@ func retryable(err error) bool {
 // the request's shape. Only such an error is worth retrying a step lower down
 // the structured-output levels.
 //
-// The list is deliberately short. A 400 and a 422 are how a provider rejects a
-// field it cannot honour, and a 501 is how it says the feature is not
-// implemented. Every other status says something else entirely and must not
-// send the client probing: a 404 is a wrong base URL or an unknown model, a
-// 405 a wrong method, a 413 a prompt that is too long, a 409 or a 423 a
-// conflict, and an auth failure, a timeout, a rate limit or a 5xx have nothing
-// to do with the request document at all. Sending a downgrade probe for those
-// costs two extra calls and answers a question nobody asked.
+// Any 4xx counts, except the four that plainly mean something else: an auth
+// failure, a rate limit, and a timeout say nothing about the request document.
+//
+// This used to be a short allowlist of 400, 422 and 501, on the reasoning that
+// those are how a provider rejects a field it cannot honour. That was too
+// clever. A real endpoint answers "json_schema response format is not
+// supported for model X" with a 405, and the allowlist let that fail outright
+// instead of stepping down to a format the model does accept. Which status a
+// provider picks for "I cannot do that" is not something worth predicting.
+//
+// Guessing wide is cheap because a downgrade is only remembered once a lower
+// level has actually answered: a 4xx that had nothing to do with the request
+// shape fails at every level, costs two extra calls on a request that was
+// failing anyway, and leaves the client's negotiated level untouched.
 func unsupportedShape(err error) bool {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
 		return false
 	}
 	switch apiErr.StatusCode {
-	case http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusNotImplemented:
+	case http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	case http.StatusNotImplemented:
+		// The one 5xx that is about the request rather than the moment, and
+		// the one this package does not retry.
 		return true
 	}
-	return false
+	return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500
 }
 
 // backoffFor computes the delay before the next attempt: an honoured

@@ -756,15 +756,18 @@ func TestUnsupportedShapeClassification(t *testing.T) {
 		err  error
 		want bool
 	}{
-		// The only three statuses that say anything about the request's shape.
+		// Any 4xx may be how this provider says "I cannot do that".
 		{"bad request", &APIError{StatusCode: 400}, true},
 		{"unprocessable", &APIError{StatusCode: 422}, true},
 		{"not implemented", &APIError{StatusCode: 501}, true},
-		// A wrong base URL or an unknown model, not a rejected field.
-		{"not found", &APIError{StatusCode: 404}, false},
-		{"method not allowed", &APIError{StatusCode: 405}, false},
-		{"conflict", &APIError{StatusCode: 409}, false},
-		{"payload too large", &APIError{StatusCode: 413}, false},
+		// A real endpoint answers "json_schema response format is not
+		// supported for model X" with a 405. Predicting which status a
+		// provider picks for that is a losing game, so all of these probe.
+		{"method not allowed", &APIError{StatusCode: 405}, true},
+		{"not found", &APIError{StatusCode: 404}, true},
+		{"conflict", &APIError{StatusCode: 409}, true},
+		{"payload too large", &APIError{StatusCode: 413}, true},
+		// These four say nothing about the request document.
 		{"unauthorized", &APIError{StatusCode: 401}, false},
 		{"forbidden", &APIError{StatusCode: 403}, false},
 		{"request timeout", &APIError{StatusCode: 408}, false},

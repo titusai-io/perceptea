@@ -35,7 +35,7 @@ func TestLoadFromDefaults(t *testing.T) {
 		Addr:                    ":8080",
 		BaseURL:                 "https://api.deepinfra.com/v1/openai",
 		APIKey:                  "",
-		Model:                   "meta-llama/Meta-Llama-3.1-8B-Instruct",
+		Model:                   "mistralai/Mistral-Small-24B-Instruct-2501",
 		ReasoningEffort:         "",
 		Temperature:             0,
 		MaxConcurrency:          8,
@@ -56,7 +56,7 @@ func TestLoadFromDefaults(t *testing.T) {
 	if DefaultInferenceBaseURL != "https://api.deepinfra.com/v1/openai" {
 		t.Errorf("DefaultInferenceBaseURL = %q", DefaultInferenceBaseURL)
 	}
-	if DefaultModel != "meta-llama/Meta-Llama-3.1-8B-Instruct" {
+	if DefaultModel != "mistralai/Mistral-Small-24B-Instruct-2501" {
 		t.Errorf("DefaultModel = %q", DefaultModel)
 	}
 }

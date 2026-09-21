@@ -4,7 +4,7 @@
 # any request. Everything below is a real, runnable example of the three
 # question types.
 #
-# Start the service first. DeepInfra and meta-llama/Meta-Llama-3.1-8B-Instruct
+# Start the service first. DeepInfra and mistralai/Mistral-Small-24B-Instruct-2501
 # are already the defaults, so a key is the only thing it needs:
 #
 #     PERCEPTEA_API_KEY=<your DeepInfra key> go run ./cmd/perceptea
@@ -334,7 +334,7 @@ Content-Type: application/json
   "state": "Charged twice again!!",
   "inference_base_url": "https://api.deepinfra.com/v1/openai",
   "api_key": "{{$dotenv PERCEPTEA_API_KEY}}",
-  "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+  "model": "mistralai/Mistral-Small-24B-Instruct-2501",
   "questions": {
     "angry": { "type": "noul", "instructions": "The customer is angry" }
   }

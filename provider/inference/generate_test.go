@@ -237,7 +237,7 @@ func TestGenerateOnlyRemembersADropThatAnswered(t *testing.T) {
 
 func TestGenerateDoesNotProbeOnAFailureUnrelatedToTheRequestShape(t *testing.T) {
 	api := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
-		writeJSON(w, http.StatusNotFound, `{"error":{"message":"no such endpoint"}}`)
+		writeJSON(w, http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)
 	})
 	client, _ := newTestClient(t, api, nil)
 
@@ -245,7 +245,7 @@ func TestGenerateDoesNotProbeOnAFailureUnrelatedToTheRequestShape(t *testing.T) 
 		t.Fatal("want an error")
 	}
 	if api.count() != 1 {
-		t.Errorf("made %d calls, want 1: a 404 says nothing about response_format", api.count())
+		t.Errorf("made %d calls, want 1: a rejected key says nothing about response_format", api.count())
 	}
 	if lvl := client.outputLevel(); lvl != levelJSONSchema {
 		t.Errorf("level = %v, want json_schema", lvl)

@@ -45,7 +45,7 @@ const (
 	// scorer asks for first; and input tokens are what a fan-out of small
 	// calls is billed for, which is where it is cheapest. See the README's
 	// "Choosing a model".
-	DefaultModel = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+	DefaultModel = "mistralai/Mistral-Small-24B-Instruct-2501"
 	// DefaultTemperature is 0 because it is the only setting that makes a
 	// classification reproducible.
 	DefaultTemperature = 0.0

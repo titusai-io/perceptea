@@ -251,6 +251,40 @@ func TestScoreRemembersTheDowngrade(t *testing.T) {
 // this, one bad model name or one over-long prompt permanently strips
 // structured output from every later request the client serves, and a client
 // cached across requests carries that to everybody.
+// A provider that cannot honour a schema does not have to say so with a 400.
+// DeepInfra answers "json_schema response format is not supported for model X"
+// with a 405, and an allowlist of statuses that were thought to mean "bad
+// field" let that fail outright instead of stepping down to a format the model
+// does accept.
+func TestScoreStepsDownWhenAnUnsupportedFormatIsRejectedWithA405(t *testing.T) {
+	api := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 0 {
+			writeJSON(w, http.StatusMethodNotAllowed,
+				`{"error":{"message":"json_schema response format is not supported for model: some/model"}}`)
+			return
+		}
+		writeJSON(w, http.StatusOK, scoreBody(`{"p":0.42}`))
+	})
+	client, _ := newTestClient(t, api, nil)
+
+	got, err := client.Score(context.Background(), fixtureRequest)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.Probability != 0.42 {
+		t.Errorf("probability = %v, want 0.42", got.Probability)
+	}
+	if api.count() != 2 {
+		t.Fatalf("made %d calls, want 2: the schema probe and the step down", api.count())
+	}
+	if f := api.request(t, 1).format(t); f != "json_object" {
+		t.Errorf("the second call sent response_format %q, want json_object", f)
+	}
+	if lvl := client.outputLevel(); lvl != levelJSONObject {
+		t.Errorf("level = %v, want json_object remembered: it is the one that answered", lvl)
+	}
+}
+
 func TestScoreOnlyRemembersALevelThatAnswered(t *testing.T) {
 	api := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, n int) {
 		if n < 3 {
@@ -293,9 +327,15 @@ func TestScoreDoesNotProbeOnAFailureUnrelatedToTheRequestShape(t *testing.T) {
 		name   string
 		status int
 	}{
-		{"a base URL missing /v1", http.StatusNotFound},
-		{"the wrong method", http.StatusMethodNotAllowed},
-		{"a prompt over the context length", http.StatusRequestEntityTooLarge},
+		// Only these four. Anything else a provider might answer could be its
+		// way of saying it cannot honour a field, so the client probes rather
+		// than guessing — probing is cheap, because a level is only
+		// remembered once it has answered.
+		// A timeout and a rate limit are the other two, but those are
+		// retried, so they cannot be counted this way;
+		// TestUnsupportedShapeClassification covers all four.
+		{"a rejected key", http.StatusUnauthorized},
+		{"a forbidden key", http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
