@@ -652,6 +652,16 @@ CI runs `gofmt`, `go mod tidy` (with `git diff --exit-code` behind it, so the
 zero-dependency claim at the top of this file is checked rather than trusted),
 `go vet`, `go build` and `go test -race` on every push and pull request.
 
+## Contributing
+
+Pull requests are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the
+development setup, the four checks CI runs, and the testing rules — the one
+worth knowing in advance is that **every commit must be signed off**
+(`git commit -s`), which a check on the pull request enforces.
+
+Notable changes are recorded in [`CHANGELOG.md`](CHANGELOG.md), and
+contributors in [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
+
 ## Limitations
 
 - **The probabilities are normalised opinions, not calibrated ones.** A
