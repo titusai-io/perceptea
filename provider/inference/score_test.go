@@ -285,6 +285,75 @@ func TestScoreStepsDownWhenAnUnsupportedFormatIsRejectedWithA405(t *testing.T) {
 	}
 }
 
+// A provider may wrap its own upstream's rejection in a 500 and still name
+// the field it could not honour. Observed verbatim from a hosted endpoint:
+// a 500 whose body carries a <400> and "Format error :
+// 'response_format.json_schema.schema'". A 500 is normally retried and never
+// probes, so without reading the message this cost three retries and then
+// failed, with a format the model would have accepted one step below.
+func TestScoreStepsDownWhenAFormatComplaintArrivesAsA500(t *testing.T) {
+	const complaint = `{"error":{"message":"<400> InternalError.Algo.InvalidParameter: Format error : ` +
+		`'response_format.json_schema.schema'. the specific reason is as follows: None is not of type ` +
+		`'object', 'boolean'.","type":"invalid_request_error","code":"invalid_parameter_error"}}`
+
+	api := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, n int) {
+		if n == 0 {
+			writeJSON(w, http.StatusInternalServerError, complaint)
+			return
+		}
+		writeJSON(w, http.StatusOK, scoreBody(`{"p":0.61}`))
+	})
+	client, sleeps := newTestClient(t, api, nil)
+
+	got, err := client.Score(context.Background(), fixtureRequest)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.Probability != 0.61 {
+		t.Errorf("probability = %v, want 0.61", got.Probability)
+	}
+	if api.count() != 2 {
+		t.Fatalf("made %d calls, want 2: the schema attempt and the step down", api.count())
+	}
+	if n := len(sleeps.durations()); n != 0 {
+		t.Errorf("backed off %d times, want 0: naming the field is not a transient failure", n)
+	}
+	if f := api.request(t, 1).format(t); f != "json_object" {
+		t.Errorf("the second call sent response_format %q, want json_object", f)
+	}
+	if lvl := client.outputLevel(); lvl != levelJSONObject {
+		t.Errorf("level = %v, want json_object remembered", lvl)
+	}
+}
+
+// The converse: a 500 that says nothing about the request is still a
+// transient failure, retried and never probed.
+func TestScoreStillRetriesAPlainServerError(t *testing.T) {
+	api := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, n int) {
+		if n < 2 {
+			writeJSON(w, http.StatusInternalServerError, `{"error":{"message":"internal error"}}`)
+			return
+		}
+		writeJSON(w, http.StatusOK, scoreBody(`{"p":0.2}`))
+	})
+	client, sleeps := newTestClient(t, api, nil)
+
+	if _, err := client.Score(context.Background(), fixtureRequest); err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if n := len(sleeps.durations()); n != 2 {
+		t.Errorf("backed off %d times, want 2", n)
+	}
+	if lvl := client.outputLevel(); lvl != levelJSONSchema {
+		t.Errorf("level = %v, want json_schema: a plain 500 says nothing about the format", lvl)
+	}
+	for i := range 3 {
+		if f := api.request(t, i).format(t); f != "json_schema" {
+			t.Errorf("call %d sent response_format %q, want json_schema throughout", i, f)
+		}
+	}
+}
+
 func TestScoreOnlyRemembersALevelThatAnswered(t *testing.T) {
 	api := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, n int) {
 		if n < 3 {

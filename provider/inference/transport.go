@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -164,6 +165,34 @@ func drain(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
+// formatComplaintPattern matches a provider naming the response-format field
+// it could not honour. Deliberately narrow: the two field names, and not the
+// bare word "schema", which turns up in errors about the caller's own data.
+var formatComplaintPattern = regexp.MustCompile(`(?i)response[_ -]?format|json[_ -]?schema`)
+
+// formatComplaint reports whether an error is the provider saying, in words,
+// that it cannot honour the response format it was sent.
+//
+// This exists because the status code is not a reliable signal and two real
+// endpoints proved it. One answered "json_schema response format is not
+// supported for model X" with a 405. Another wrapped its own upstream's 400
+// in a 500 and said "Format error : 'response_format.json_schema.schema'".
+// Neither status means "bad field" by any convention, and a rule that guesses
+// from the status alone failed both times. When the provider names the field,
+// believe the provider.
+//
+// Both the parsed message and the raw body are searched, because a provider
+// that nests its real error inside another document leaves nothing useful in
+// the parsed message.
+func formatComplaint(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return formatComplaintPattern.MatchString(apiErr.Message) ||
+		formatComplaintPattern.MatchString(apiErr.Body)
+}
+
 // retryable reports whether an attempt is worth repeating: a 408, a 429, a
 // 5xx, or a transport failure. Every 4xx, a cancelled context, and a malformed
 // success body are final.
@@ -179,6 +208,12 @@ func retryable(err error) bool {
 	}
 	var final *nonRetryable
 	if errors.As(err, &final) {
+		return false
+	}
+	if formatComplaint(err) {
+		// The provider has said it cannot honour the response format. That
+		// is a fact about the request, not about this moment, so repeating
+		// it cannot help — and the caller is about to step a level down.
 		return false
 	}
 	var apiErr *APIError
@@ -215,6 +250,11 @@ func retryable(err error) bool {
 // shape fails at every level, costs two extra calls on a request that was
 // failing anyway, and leaves the client's negotiated level untouched.
 func unsupportedShape(err error) bool {
+	if formatComplaint(err) {
+		// The provider named the field it could not honour, which beats any
+		// inference from the status code.
+		return true
+	}
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
 		return false

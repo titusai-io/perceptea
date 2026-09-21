@@ -290,6 +290,17 @@ the ones that do not.
 
 Tags and prices move; check the list rather than this table when it matters.
 
+**A `structured-output` tag is not a promise the strict schema will be
+accepted.** It says the model can be constrained; the endpoint in front of it
+still has to accept the exact `response_format` sent, and some reject a strict
+`json_schema` while accepting `json_object` — sometimes reporting it as a 405,
+sometimes as a 500 wrapping their own upstream's 400. The service reads the
+message rather than the status, steps down, and remembers the level that
+answered, so this costs one extra call per client and then nothing. It is
+worth knowing it happened, because the strict schema is the one setting that
+makes a non-probability reply impossible: look for `structured output
+downgraded` at debug level.
+
 ### What it costs
 
 Take a 300-token state and the 9-candidate request above. Each call carries
