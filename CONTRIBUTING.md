@@ -207,3 +207,9 @@ Signing off is a statement about provenance, not an assignment of copyright.
 It says you wrote the change, or otherwise have the right to submit it under
 the project's license, and that you are happy for it to be distributed as
 part of the project.
+
+Perceptea is licensed under the [GNU Affero General Public License
+v3.0](LICENSE). It is worth reading before you contribute if you have not met
+it: it is a strong copyleft licence, and its network clause reaches anyone who
+runs a modified version as a service. Signing off says your contribution can
+be distributed under it.

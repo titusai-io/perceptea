@@ -663,6 +663,16 @@ worth knowing in advance is that **every commit must be signed off**
 Notable changes are recorded in [`CHANGELOG.md`](CHANGELOG.md), and
 contributors in [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
 
+## License
+
+Perceptea is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+The AGPL's network clause is the part that matters for a service like this
+one: running a modified Perceptea and letting other people reach it over a
+network counts as distribution, so they are entitled to the source of your
+modified version. Using it unmodified, or modifying it for yourself and
+nobody else, carries no such obligation.
+
 ## Limitations
 
 - **The probabilities are normalised opinions, not calibrated ones.** A

@@ -11,6 +11,8 @@ always called out below.
 
 ### Added
 
+- **Licensed under the GNU Affero General Public License v3.0.**
+
 - **The `classifier` package**: a reusable, standard-library-only classifier.
   Declared questions are answered by scoring each candidate independently and
   normalising the results through a logit transform and a softmax. Three
