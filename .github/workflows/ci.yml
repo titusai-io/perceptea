@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  # A branch with an open pull request gets a push event and a
+  # pull_request event for the same commit, so an unfiltered push trigger
+  # runs everything twice. Pushes to main are the ones no pull request
+  # covers; everything else arrives as a pull request, including from a
+  # fork.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push supersedes the run in flight for the same ref. main is exempt:
+# its runs say whether a merged commit is good, and cancelling one leaves
+# that unanswered.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          gofmt -l .
+          test -z "$(gofmt -l .)"
+
+      # The zero-dependency claim is the first thing the README makes, so it
+      # is checked rather than trusted: tidy, then fail if anything moved.
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race ./...

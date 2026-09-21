@@ -1,0 +1,396 @@
+# Perceptea — worked requests against DeepInfra
+#
+# Open in VS Code (REST Client extension) or a JetBrains IDE and click Send on
+# any request. Everything below is a real, runnable example of the three
+# question types.
+#
+# Start the service first. DeepInfra and mistralai/Mistral-Small-24B-Instruct-2501
+# are already the defaults, so a key is the only thing it needs:
+#
+#     PERCEPTEA_API_KEY=<your DeepInfra key> go run ./cmd/perceptea
+#
+# The server holds the key, so none of these requests carry one. The last
+# section shows the per-request override form for when you want to point a
+# single call somewhere else.
+
+@host = http://localhost:5301
+
+
+###############################################################################
+# Is the service up, and what will it call?
+###############################################################################
+
+### Health — the resolved endpoint and model, and whether a key is configured
+GET {{host}}/api/health
+
+
+###############################################################################
+# 1. noul — the if-statement query
+#
+# One call. The number that comes back IS the probability the statement is
+# true, so there is no separate confidence: branch on it directly.
+#
+#     if answer.noul > 0.9 { ... }
+###############################################################################
+
+### noul — is the customer angry?
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "This is the SECOND month in a row I've been billed twice for the Pro plan. Fix it ASAP.",
+  "questions": {
+    "angry": {
+      "type": "noul",
+      "instructions": "The customer is expressing strong frustration or anger"
+    }
+  }
+}
+
+### noul — a moderation gate, phrased as a question
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "This product is absolute garbage and the CEO should be ashamed. Refund me now or I'll post this everywhere.",
+  "questions": {
+    "toxic": {
+      "type": "noul",
+      "instructions": "Does this message contain toxic or abusive language?"
+    }
+  }
+}
+
+### noul — several independent propositions in one request
+# Each is scored on its own, in parallel, against the same state.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "Hi — my API key stopped working this morning and the dashboard shows my account as suspended. I paid the invoice on the 3rd. Please sort this out today, we have a launch on Friday.",
+  "questions": {
+    "is_urgent":       { "type": "noul", "instructions": "The message conveys urgency or a deadline" },
+    "mentions_payment":{ "type": "noul", "instructions": "The message refers to a payment, invoice or charge" },
+    "is_blocked":      { "type": "noul", "instructions": "The customer is currently unable to use the product" },
+    "wants_refund":    { "type": "noul", "instructions": "The customer is asking for a refund" }
+  }
+}
+
+
+###############################################################################
+# 2. choice — the multiple-choice query
+#
+# One call per option, scored independently, then normalised. You get the
+# winner AND the full distribution, so you can see how close the runner-up was.
+# 1 to 255 options. Declaration order breaks an exact tie.
+###############################################################################
+
+### choice — route a support ticket
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "Charged twice again!! Second month in a row.",
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "billing":   "Charges, refunds, invoices, subscription changes",
+        "technical": "Bugs, outages, integration and product issues",
+        "account":   "Login, access, permissions, account settings",
+        "other":     "Anything that does not fit the categories above"
+      }
+    }
+  }
+}
+
+### choice — pick a moderation action
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "You people are useless. Third time asking. Cancel my account.",
+  "questions": {
+    "action": {
+      "type": "choice",
+      "instructions": "Recommended moderation action",
+      "criteria": {
+        "allow": "Publish as-is, nothing objectionable",
+        "flag":  "Publish but flag for a human to review",
+        "block": "Do not publish"
+      }
+    }
+  }
+}
+
+### choice — a JSON object as the state
+# The state may be a string, an object or an array. Object key order is
+# preserved into the prompt exactly as written here.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": {
+    "subject": "Integration failing for 3 days",
+    "from": "ops@customer.example",
+    "plan": "Enterprise",
+    "body": "We've been trying to connect our payment provider for three days and it keeps failing at the callback step. We are losing sales."
+  },
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "billing":   "Payment or subscription issues",
+        "technical": "Bugs or integration problems",
+        "sales":     "Pricing, plans or account expansion"
+      }
+    }
+  }
+}
+
+
+###############################################################################
+# 3. score — the rating query
+#
+# One call per level. The answer is the EXPECTED VALUE over the level indices,
+# so it can land between two declared levels: 2.57 means "between High and
+# Critical, leaning Critical". The legend maps indices back to your labels.
+# 2 to 10 levels, and they should read as a monotonic scale.
+###############################################################################
+
+### score — how urgent is this?
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "This is the SECOND month in a row I've been billed twice. Fix it ASAP.",
+  "questions": {
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this request?",
+      "criteria": ["Low", "Medium", "High", "Critical"]
+    }
+  }
+}
+
+### score — descriptive levels beat bare labels
+# The model reads these strings, so a level that describes what it looks like
+# scores better than a one-word label.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "I've asked about this twice now and nobody has replied. Getting pretty tired of it.",
+  "questions": {
+    "frustration": {
+      "type": "score",
+      "instructions": "How frustrated does the customer appear?",
+      "criteria": [
+        "Calm, simply stating facts",
+        "Mildly annoyed but polite",
+        "Clearly frustrated, pointed language",
+        "Very angry, hostile or threatening"
+      ]
+    }
+  }
+}
+
+### score — a ten-level scale, the maximum
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "The docs for the batch endpoint are wrong: the example passes `items` but the API expects `records`. Took me an hour to work out.",
+  "questions": {
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is the problem being reported, from trivial to critical?",
+      "criteria": [
+        "Trivial — cosmetic, no user impact",
+        "Very minor — a small annoyance",
+        "Minor — a workaround exists and is obvious",
+        "Moderate — a workaround exists but is not obvious",
+        "Noticeable — wastes meaningful time",
+        "Significant — blocks a secondary workflow",
+        "Serious — blocks a primary workflow",
+        "Severe — blocks the product's main purpose",
+        "Critical — data loss or a security concern",
+        "Emergency — active outage affecting everyone"
+      ]
+    }
+  }
+}
+
+
+###############################################################################
+# All three at once
+#
+# Questions run concurrently, and so do the candidates within each. This one
+# issues 4 + 4 + 1 = 9 upstream calls in a single wave — check
+# meta.parallel_calls in the response.
+###############################################################################
+
+### choice + score + noul in one request
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": {
+    "subject": "Charged twice again!!",
+    "message": "This is the SECOND month in a row I've been billed twice for the Pro plan. Fix it ASAP."
+  },
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "billing":   "Charges, refunds, invoices",
+        "technical": "Bugs or product issues",
+        "account":   "Login or access problems",
+        "other":     "Does not fit the above"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this?",
+      "criteria": ["Low", "Medium", "High", "Critical"]
+    },
+    "angry": {
+      "type": "noul",
+      "instructions": "The customer is expressing strong frustration or anger"
+    }
+  }
+}
+
+
+###############################################################################
+# Options
+###############################################################################
+
+### Override the model for one request
+# Any model the endpoint serves, as long as it does not reason: a scoring
+# reply is capped at 32 tokens, and a thinking model spends them all before
+# it writes the JSON. That comes back as a 502 saying so. See "Choosing a
+# model" in the README for the candidates and their prices.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "The checkout page 500s when the cart is empty.",
+  "model": "mistralai/Mistral-Nemo-Instruct-2407",
+  "questions": {
+    "is_bug": { "type": "noul", "instructions": "This describes a software defect" }
+  }
+}
+
+### What a reasoning model does to this service
+# zai-org/GLM-5.3-Flash is tagged reasoning on DeepInfra with no way to turn
+# the thinking off, so the 32-token scoring reply never reaches the JSON.
+# Send this to see the failure: a 502 upstream_error explaining that the
+# reply was cut off, instead of the uniform distribution it used to return.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "The checkout page 500s when the cart is empty.",
+  "model": "zai-org/GLM-5.3-Flash",
+  "questions": {
+    "is_bug": { "type": "noul", "instructions": "This describes a software defect" }
+  }
+}
+
+### oneshot mode — the single-document approach, for comparison
+# Asks the model for one JSON document covering every question instead of
+# scoring each candidate separately. It exists to compare against; it is
+# markedly less reliable and parallel is the mode to use.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "Charged twice again!! Second month in a row.",
+  "mode": "oneshot",
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": { "billing": "Charges and refunds", "technical": "Bugs", "other": "Neither" }
+    },
+    "angry": { "type": "noul", "instructions": "The customer is angry" }
+  }
+}
+
+### Point one request at a different endpoint
+# Only honoured while PERCEPTEA_ALLOW_REQUEST_CREDENTIALS is true (the
+# default). Turn it off outside development: with it on, any caller can name
+# an endpoint and have the service call it.
+#
+# {{$dotenv KEY}} reads the repository's .env file in VS Code REST Client.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "Charged twice again!!",
+  "inference_base_url": "https://api.deepinfra.com/v1/openai",
+  "api_key": "{{$dotenv PERCEPTEA_API_KEY}}",
+  "model": "mistralai/Mistral-Small-24B-Instruct-2501",
+  "questions": {
+    "angry": { "type": "noul", "instructions": "The customer is angry" }
+  }
+}
+
+
+###############################################################################
+# Failure modes — each returns a 400 with a machine-readable code
+###############################################################################
+
+### No questions — 400 invalid_request
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{ "state": "anything", "questions": {} }
+
+### Missing state — 400 invalid_request
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{ "questions": { "angry": { "type": "noul", "instructions": "The customer is angry" } } }
+
+### A score scale of one level — 400 invalid_request
+# A single level carries no information, so 2 to 10 are the bounds.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "anything",
+  "questions": {
+    "urgency": { "type": "score", "instructions": "How urgent?", "criteria": ["Urgent"] }
+  }
+}
+
+### An unknown question type — 400 invalid_json
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "anything",
+  "questions": {
+    "rank": { "type": "ranking", "instructions": "Rank these" }
+  }
+}
+
+### A misspelled field — 400 invalid_json naming it
+# Unknown top-level fields are rejected rather than ignored: a mistyped
+# api_key would otherwise spend the server's credential without saying so.
+POST {{host}}/api/evaluate
+Content-Type: application/json
+
+{
+  "state": "anything",
+  "apikey": "sk-whatever",
+  "questions": { "angry": { "type": "noul", "instructions": "The customer is angry" } }
+}
+
+### A wrong method — 405 method_not_allowed, with an Allow header
+GET {{host}}/api/evaluate

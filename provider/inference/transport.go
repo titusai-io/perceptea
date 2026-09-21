@@ -1,0 +1,410 @@
+package inference
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+const (
+	// completionsPath is appended to the configured base URL.
+	completionsPath = "/chat/completions"
+	// maxErrorBody is how much of a failing response is kept on an
+	// [APIError] for diagnosis.
+	maxErrorBody = 512
+	// maxReadBody bounds how much of any response body is read at all, so a
+	// misbehaving endpoint cannot stream unbounded memory into the process.
+	maxReadBody = 1 << 20
+	// baseBackoff is the first retry delay, doubled per attempt.
+	baseBackoff = 500 * time.Millisecond
+	// maxBackoff caps both the computed backoff and an honoured
+	// Retry-After.
+	maxBackoff = 30 * time.Second
+	// maxBackoffShift bounds the doubling so the shift cannot overflow.
+	maxBackoffShift = 16
+)
+
+// APIError is a non-2xx response from the endpoint.
+type APIError struct {
+	// StatusCode is the HTTP status.
+	StatusCode int
+	// Type and Code are the provider's own classification, when it sends
+	// one.
+	Type string
+	Code string
+	// Message is the provider's message, falling back to the raw body and
+	// then to the HTTP status text.
+	Message string
+	// Body is the raw response body, truncated, with the API key removed.
+	Body string
+
+	// retryAfter carries a Retry-After header through to the backoff
+	// calculation, which runs after the response has been closed.
+	retryAfter    time.Duration
+	hasRetryAfter bool
+}
+
+// Error implements error. It never contains the API key.
+func (e *APIError) Error() string {
+	var b strings.Builder
+	b.WriteString("inference: http ")
+	b.WriteString(strconv.Itoa(e.StatusCode))
+	if e.Message != "" {
+		b.WriteString(": ")
+		b.WriteString(e.Message)
+	}
+	var extra []string
+	if e.Type != "" {
+		extra = append(extra, "type="+e.Type)
+	}
+	if e.Code != "" {
+		extra = append(extra, "code="+e.Code)
+	}
+	if len(extra) > 0 {
+		b.WriteString(" (")
+		b.WriteString(strings.Join(extra, ", "))
+		b.WriteString(")")
+	}
+	return b.String()
+}
+
+// nonRetryable marks an error that must not be retried even though it is not
+// an [APIError] — a malformed success body, for instance.
+type nonRetryable struct{ err error }
+
+func (e *nonRetryable) Error() string { return e.err.Error() }
+func (e *nonRetryable) Unwrap() error { return e.err }
+
+// complete POSTs one chat completion, retrying transient failures.
+func (c *Client) complete(ctx context.Context, body chatRequest) (*chatResponse, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("inference: encode request: %w", err)
+	}
+	endpoint := c.baseURL + completionsPath
+	attempts := c.maxRetries + 1
+
+	var last error
+	for attempt := range attempts {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		resp, err := c.attempt(ctx, endpoint, payload, body.Model, attempt)
+		if err == nil {
+			return resp, nil
+		}
+		last = err
+		if attempt == attempts-1 || !retryable(err) {
+			return nil, err
+		}
+		if serr := c.sleep(ctx, backoffFor(attempt, err)); serr != nil {
+			return nil, fmt.Errorf("inference: retry abandoned: %w (last attempt: %w)", serr, last)
+		}
+	}
+	return nil, last
+}
+
+// attempt performs one HTTP round trip.
+func (c *Client) attempt(ctx context.Context, endpoint string, payload []byte, model string, attempt int) (*chatResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, &nonRetryable{fmt.Errorf("inference: build request: %w", err)}
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if c.referer != "" {
+		req.Header.Set("HTTP-Referer", c.referer)
+	}
+	if c.title != "" {
+		req.Header.Set("X-Title", c.title)
+	}
+
+	start := time.Now()
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.log.DebugContext(ctx, "inference: chat completion failed",
+			"model", model,
+			"attempt", attempt+1,
+			"latency_ms", time.Since(start).Milliseconds())
+		return nil, fmt.Errorf("inference: chat completion: %w", err)
+	}
+	defer drain(resp)
+
+	c.log.DebugContext(ctx, "inference: chat completion",
+		"model", model,
+		"attempt", attempt+1,
+		"status", resp.StatusCode,
+		"latency_ms", time.Since(start).Milliseconds())
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, c.apiError(resp)
+	}
+
+	var out chatResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReadBody)).Decode(&out); err != nil {
+		return nil, &nonRetryable{fmt.Errorf("inference: decode response: %w", err)}
+	}
+	return &out, nil
+}
+
+// drain empties and closes a response body so the connection returns to the
+// idle pool instead of being torn down.
+func drain(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxReadBody))
+	_ = resp.Body.Close()
+}
+
+// formatComplaintPattern matches a provider naming the response-format field
+// it could not honour. Deliberately narrow: the two field names, and not the
+// bare word "schema", which turns up in errors about the caller's own data.
+var formatComplaintPattern = regexp.MustCompile(`(?i)response[_ -]?format|json[_ -]?schema`)
+
+// formatComplaint reports whether an error is the provider saying, in words,
+// that it cannot honour the response format it was sent.
+//
+// This exists because the status code is not a reliable signal and two real
+// endpoints proved it. One answered "json_schema response format is not
+// supported for model X" with a 405. Another wrapped its own upstream's 400
+// in a 500 and said "Format error : 'response_format.json_schema.schema'".
+// Neither status means "bad field" by any convention, and a rule that guesses
+// from the status alone failed both times. When the provider names the field,
+// believe the provider.
+//
+// Both the parsed message and the raw body are searched, because a provider
+// that nests its real error inside another document leaves nothing useful in
+// the parsed message.
+func formatComplaint(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return formatComplaintPattern.MatchString(apiErr.Message) ||
+		formatComplaintPattern.MatchString(apiErr.Body)
+}
+
+// retryable reports whether an attempt is worth repeating: a 408, a 429, a
+// 5xx, or a transport failure. Every 4xx, a cancelled context, and a malformed
+// success body are final.
+//
+// A 501 is the one 5xx that is final too. "Not implemented" is a statement
+// about the endpoint rather than about this moment, so repeating the call
+// cannot change it — and because a 501 does send the client a level lower (see
+// [unsupportedShape]), retrying it would multiply the whole negotiation by the
+// retry count.
+func retryable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var final *nonRetryable
+	if errors.As(err, &final) {
+		return false
+	}
+	if formatComplaint(err) {
+		// The provider has said it cannot honour the response format. That
+		// is a fact about the request, not about this moment, so repeating
+		// it cannot help — and the caller is about to step a level down.
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case http.StatusRequestTimeout, http.StatusTooManyRequests:
+			return true
+		case http.StatusNotImplemented:
+			return false
+		}
+		return apiErr.StatusCode >= 500
+	}
+	// Anything left is a transport error: DNS, dial, reset, truncated read.
+	return true
+}
+
+// unsupportedShape reports whether an error plausibly means "this provider
+// does not understand the request I sent" rather than something unrelated to
+// the request's shape. Only such an error is worth retrying a step lower down
+// the structured-output levels.
+//
+// Any 4xx counts, except the four that plainly mean something else: an auth
+// failure, a rate limit, and a timeout say nothing about the request document.
+//
+// This used to be a short allowlist of 400, 422 and 501, on the reasoning that
+// those are how a provider rejects a field it cannot honour. That was too
+// clever. A real endpoint answers "json_schema response format is not
+// supported for model X" with a 405, and the allowlist let that fail outright
+// instead of stepping down to a format the model does accept. Which status a
+// provider picks for "I cannot do that" is not something worth predicting.
+//
+// Guessing wide is cheap because a downgrade is only remembered once a lower
+// level has actually answered: a 4xx that had nothing to do with the request
+// shape fails at every level, costs two extra calls on a request that was
+// failing anyway, and leaves the client's negotiated level untouched.
+func unsupportedShape(err error) bool {
+	if formatComplaint(err) {
+		// The provider named the field it could not honour, which beats any
+		// inference from the status code.
+		return true
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	case http.StatusNotImplemented:
+		// The one 5xx that is about the request rather than the moment, and
+		// the one this package does not retry.
+		return true
+	}
+	return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500
+}
+
+// backoffFor computes the delay before the next attempt: an honoured
+// Retry-After when the provider sent one, otherwise exponential backoff with
+// equal jitter, both capped.
+func backoffFor(attempt int, err error) time.Duration {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.hasRetryAfter {
+		return min(max(apiErr.retryAfter, 0), maxBackoff)
+	}
+	shift := min(attempt, maxBackoffShift)
+	delay := min(baseBackoff<<shift, maxBackoff)
+	half := delay / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
+// retryAfterFrom reads a Retry-After header in either of its forms: a number
+// of seconds, or an HTTP date.
+func retryAfterFrom(h http.Header) (time.Duration, bool) {
+	raw := strings.TrimSpace(h.Get("Retry-After"))
+	if raw == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseFloat(raw, 64); err == nil {
+		return max(time.Duration(secs*float64(time.Second)), 0), true
+	}
+	if when, err := http.ParseTime(raw); err == nil {
+		return max(time.Until(when), 0), true
+	}
+	return 0, false
+}
+
+// errorEnvelope is the union of the error shapes seen in the wild. Every field
+// is decoded loosely because the failing path is exactly where providers
+// diverge most.
+type errorEnvelope struct {
+	Error   json.RawMessage `json:"error"`
+	Message flexString      `json:"message"`
+	Detail  flexString      `json:"detail"`
+}
+
+// errorDetail is the usual {"error":{...}} object.
+type errorDetail struct {
+	Message flexString `json:"message"`
+	Type    flexString `json:"type"`
+	Code    flexString `json:"code"`
+}
+
+// flexString decodes a JSON string, number, boolean or null into text, because
+// "code" in particular comes back as a string from some endpoints and as a
+// number from others.
+type flexString string
+
+// UnmarshalJSON implements [json.Unmarshaler]. It never returns an error.
+func (f *flexString) UnmarshalJSON(data []byte) error {
+	*f = ""
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		*f = flexString(s)
+		return nil
+	}
+	if trimmed[0] != '{' && trimmed[0] != '[' {
+		*f = flexString(trimmed)
+	}
+	return nil
+}
+
+// apiError reads a non-2xx response into an [APIError].
+func (c *Client) apiError(resp *http.Response) *APIError {
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxReadBody))
+	text := c.redact(string(raw))
+
+	out := &APIError{
+		StatusCode: resp.StatusCode,
+		Body:       truncate(text, maxErrorBody),
+	}
+
+	var env errorEnvelope
+	if err := json.Unmarshal(raw, &env); err == nil {
+		var detail errorDetail
+		if len(env.Error) > 0 {
+			if err := json.Unmarshal(env.Error, &detail); err != nil {
+				// {"error": "plain text"} and friends.
+				var flat flexString
+				_ = flat.UnmarshalJSON(env.Error)
+				detail.Message = flat
+			}
+		}
+		out.Message = string(detail.Message)
+		out.Type = string(detail.Type)
+		out.Code = string(detail.Code)
+		if out.Message == "" {
+			out.Message = string(env.Message)
+		}
+		if out.Message == "" {
+			out.Message = string(env.Detail)
+		}
+	}
+	if out.Message == "" {
+		// A body that is a bare JSON string, e.g. "upstream unavailable".
+		var bare string
+		if err := json.Unmarshal(raw, &bare); err == nil {
+			out.Message = bare
+		}
+	}
+	if out.Message == "" {
+		// A body that is not JSON at all, e.g. an nginx error page.
+		out.Message = strings.TrimSpace(out.Body)
+	}
+	if out.Message == "" {
+		out.Message = http.StatusText(resp.StatusCode)
+	}
+
+	out.Message = truncate(c.redact(out.Message), maxErrorBody)
+	out.Type = c.redact(out.Type)
+	out.Code = c.redact(out.Code)
+
+	if d, ok := retryAfterFrom(resp.Header); ok {
+		out.retryAfter, out.hasRetryAfter = d, true
+	}
+	return out
+}
+
+// truncate cuts s to at most limit bytes, never splitting a rune, and marks
+// that it did so.
+func truncate(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := s[:limit]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "…(truncated)"
+}
