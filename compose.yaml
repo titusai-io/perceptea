@@ -1,0 +1,77 @@
+# A local environment for Perceptea.
+#
+#   cp .env.example .env     # then put PERCEPTEA_API_KEY in it
+#   docker compose up --build
+#   curl localhost:8080/api/health
+#
+# The defaults point at DeepInfra, so a key is the only thing the service
+# needs. To run against a model on your own machine instead, see the ollama
+# profile at the bottom.
+
+services:
+  perceptea:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: perceptea:local
+    ports:
+      - "${PERCEPTEA_HOST_PORT:-8080}:8080"
+
+    # The whole of the configuration. .env is read by compose itself, which
+    # is why the container needs no .env of its own and the image has none.
+    environment:
+      PERCEPTEA_ADDR: ":8080"
+      PERCEPTEA_API_KEY: ${PERCEPTEA_API_KEY:?set PERCEPTEA_API_KEY in .env or the environment}
+      PERCEPTEA_INFERENCE_BASE_URL: ${PERCEPTEA_INFERENCE_BASE_URL:-https://api.deepinfra.com/v1/openai}
+      PERCEPTEA_MODEL: ${PERCEPTEA_MODEL:-mistralai/Mistral-Small-24B-Instruct-2501}
+      PERCEPTEA_REASONING_EFFORT: ${PERCEPTEA_REASONING_EFFORT:-}
+      PERCEPTEA_TEMPERATURE: ${PERCEPTEA_TEMPERATURE:-0}
+      PERCEPTEA_MAX_CONCURRENCY: ${PERCEPTEA_MAX_CONCURRENCY:-8}
+      PERCEPTEA_REQUEST_TIMEOUT: ${PERCEPTEA_REQUEST_TIMEOUT:-60s}
+      PERCEPTEA_MAX_BODY_BYTES: ${PERCEPTEA_MAX_BODY_BYTES:-2097152}
+      PERCEPTEA_ALLOW_REQUEST_CREDENTIALS: ${PERCEPTEA_ALLOW_REQUEST_CREDENTIALS:-true}
+      PERCEPTEA_LOG_LEVEL: ${PERCEPTEA_LOG_LEVEL:-debug}
+      PERCEPTEA_LOG_FORMAT: ${PERCEPTEA_LOG_FORMAT:-text}
+
+    # The image has no shell, so the healthcheck is the binary probing itself.
+    healthcheck:
+      test: ["CMD", "/perceptea", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      start_period: 2s
+      retries: 3
+
+    restart: unless-stopped
+    stop_grace_period: 40s
+
+    # Nothing here writes to disk or needs a privilege it was not given.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # An entirely local setup: a model on your machine, nothing leaving it.
+  #
+  #   docker compose --profile local-model up --build
+  #   docker compose --profile local-model exec ollama ollama pull qwen2.5:7b
+  #
+  # Then point the service at it, in .env:
+  #
+  #   PERCEPTEA_INFERENCE_BASE_URL=http://ollama:11434/v1
+  #   PERCEPTEA_MODEL=qwen2.5:7b
+  #   PERCEPTEA_API_KEY=ollama        # a token is required; any value will do
+  #
+  # Pick a model that does not reason — see "Choosing a model" in the README.
+  ollama:
+    profiles: ["local-model"]
+    image: ollama/ollama:latest
+    ports:
+      - "${OLLAMA_HOST_PORT:-11434}:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama-models:

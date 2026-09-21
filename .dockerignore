@@ -1,0 +1,23 @@
+# Keep credentials out of the build context entirely. The image reads its
+# configuration from the environment; a .env belongs on the host.
+.env
+.env.*
+!.env.example
+
+.git
+.github
+.gitignore
+.dockerignore
+Dockerfile
+compose.yaml
+
+# Build output and editor noise.
+bin/
+dist/
+perceptea
+*.test
+*.out
+coverage.*
+.DS_Store
+.idea/
+.vscode/

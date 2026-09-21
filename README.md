@@ -94,6 +94,53 @@ A local model server usually wants a throwaway key rather than no key —
 `ollama`, `EMPTY`, `lm-studio`. Short as they are, they are still scrubbed out
 of responses and log lines.
 
+## Running it in a container
+
+```bash
+cp .env.example .env          # then put PERCEPTEA_API_KEY in it
+docker compose up --build
+curl localhost:8080/api/health
+```
+
+Compose reads `.env` itself and passes the settings in as environment
+variables, so the image carries no configuration and no `.env` of its own —
+`.dockerignore` keeps both out of the build context. `PERCEPTEA_API_KEY` is
+the one variable with no default: leave it unset and compose refuses to start
+with a message saying so, rather than bringing up a service that 401s on
+every request.
+
+The image is a static binary on `distroless/static`, about 9 MB, running as
+`nonroot` with no shell, no package manager and a read-only root filesystem.
+Since there is no shell there is also no `curl`, so the healthcheck is the
+binary probing itself:
+
+```bash
+perceptea -healthcheck      # exits 0 when /api/health answers 200
+```
+
+The build runs `go vet` and the tests inside the builder stage, so an image
+that exists is an image whose tests passed. `docker build --build-arg
+VERSION=v1.2.3` stamps the version into the startup log line.
+
+### A fully local setup
+
+To run against a model on your own machine, with nothing leaving it:
+
+```bash
+docker compose --profile local-model up --build
+docker compose --profile local-model exec ollama ollama pull qwen2.5:7b
+```
+
+Then in `.env`:
+
+```bash
+PERCEPTEA_INFERENCE_BASE_URL=http://ollama:11434/v1
+PERCEPTEA_MODEL=qwen2.5:7b
+PERCEPTEA_API_KEY=ollama      # a token is required; any value will do
+```
+
+Pick one that does not reason — see [Choosing a model](#choosing-a-model).
+
 ## Configuration
 
 Everything is an environment variable; `-addr` is the one flag. A `.env` file
