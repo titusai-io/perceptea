@@ -32,7 +32,7 @@ func TestLoadFromDefaults(t *testing.T) {
 	cfg := loadWith(t, nil)
 
 	want := Config{
-		Addr:                    ":8080",
+		Addr:                    ":5301",
 		BaseURL:                 "https://api.deepinfra.com/v1/openai",
 		APIKey:                  "",
 		Model:                   "mistralai/Mistral-Small-24B-Instruct-2501",
@@ -202,7 +202,7 @@ func TestLoadFromWhitespaceOnlyValuesFallBackToDefaults(t *testing.T) {
 		"PERCEPTEA_ADDR":            "   ",
 		"PERCEPTEA_MAX_CONCURRENCY": "  16  ",
 	})
-	if cfg.Addr != ":8080" {
+	if cfg.Addr != ":5301" {
 		t.Errorf("Addr = %q, want the default for a blank value", cfg.Addr)
 	}
 	if cfg.MaxConcurrency != 16 {
@@ -274,7 +274,7 @@ func TestLoadFromNilLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFrom(nil): %v", err)
 	}
-	if cfg.Addr != ":8080" || cfg.BaseURL != DefaultInferenceBaseURL {
+	if cfg.Addr != ":5301" || cfg.BaseURL != DefaultInferenceBaseURL {
 		t.Errorf("LoadFrom(nil) = %+v, want the defaults", cfg)
 	}
 }

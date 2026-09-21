@@ -2,7 +2,7 @@
 #
 #   cp .env.example .env     # then put PERCEPTEA_API_KEY in it
 #   docker compose up --build
-#   curl localhost:8080/api/health
+#   curl localhost:5301/api/health
 #
 # The defaults point at DeepInfra, so a key is the only thing the service
 # needs. To run against a model on your own machine instead, see the ollama
@@ -16,12 +16,12 @@ services:
         VERSION: ${VERSION:-dev}
     image: perceptea:local
     ports:
-      - "${PERCEPTEA_HOST_PORT:-8080}:8080"
+      - "${PERCEPTEA_HOST_PORT:-5301}:5301"
 
     # The whole of the configuration. .env is read by compose itself, which
     # is why the container needs no .env of its own and the image has none.
     environment:
-      PERCEPTEA_ADDR: ":8080"
+      PERCEPTEA_ADDR: ":5301"
       PERCEPTEA_API_KEY: ${PERCEPTEA_API_KEY:?set PERCEPTEA_API_KEY in .env or the environment}
       PERCEPTEA_INFERENCE_BASE_URL: ${PERCEPTEA_INFERENCE_BASE_URL:-https://api.deepinfra.com/v1/openai}
       PERCEPTEA_MODEL: ${PERCEPTEA_MODEL:-mistralai/Mistral-Small-24B-Instruct-2501}

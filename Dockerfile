@@ -32,8 +32,8 @@ COPY --from=build /out/perceptea /perceptea
 
 # The service reads no files: configuration is the environment, and a .env is
 # a development convenience deliberately left out of the image.
-ENV PERCEPTEA_ADDR=:8080
-EXPOSE 8080
+ENV PERCEPTEA_ADDR=:5301
+EXPOSE 5301
 
 # The image has no curl and no shell, so the binary probes itself.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=2s --retries=3 \

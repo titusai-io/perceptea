@@ -32,7 +32,7 @@ const (
 
 // Defaults applied when a variable is unset or empty.
 const (
-	DefaultAddr = ":8080"
+	DefaultAddr = ":5301"
 	// DefaultInferenceBaseURL is the API root the scoring calls go to when
 	// PERCEPTEA_INFERENCE_BASE_URL is unset. It is an API root, not an
 	// endpoint: the client appends /chat/completions to it.

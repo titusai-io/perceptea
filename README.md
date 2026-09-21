@@ -60,7 +60,7 @@ go run ./cmd/perceptea
 ```
 
 ```
-time=2026-09-20T21:12:58.122-04:00 level=INFO msg="perceptea listening" addr=[::]:8080
+time=2026-09-20T21:12:58.122-04:00 level=INFO msg="perceptea listening" addr=[::]:5301
   inference_base_url=https://api.deepinfra.com/v1/openai
   model=mistralai/Mistral-Small-24B-Instruct-2501
   api_key_configured=true allow_request_credentials=true request_timeout=1m0s
@@ -99,7 +99,7 @@ of responses and log lines.
 ```bash
 cp .env.example .env          # then put PERCEPTEA_API_KEY in it
 docker compose up --build
-curl localhost:8080/api/health
+curl localhost:5301/api/health
 ```
 
 Compose reads `.env` itself and passes the settings in as environment
@@ -150,7 +150,7 @@ comes up and rejects the requests that would need one with a 401.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `PERCEPTEA_ADDR` | `:8080` | Listen address. `-addr` overrides it. |
+| `PERCEPTEA_ADDR` | `:5301` | Listen address. `-addr` overrides it. |
 | `PERCEPTEA_INFERENCE_BASE_URL` | `https://api.deepinfra.com/v1/openai` | The API root of the service that runs the model — see below. Must be an absolute `http` or `https` URL. A credential in it — userinfo, or a `?key=` — never reaches a response or a log line. |
 | `PERCEPTEA_API_KEY` | — | The key sent to that endpoint as a bearer token. The only variable a key is read from. |
 | `PERCEPTEA_MODEL` | `mistralai/Mistral-Small-24B-Instruct-2501` | The model id to score with. It has to be one the endpoint above serves, and it should be one that does not reason — see [Choosing a model](#choosing-a-model). |
@@ -402,7 +402,7 @@ on this state, and that is all it says.
 ### `POST /api/evaluate`
 
 ```bash
-curl -s localhost:8080/api/evaluate \
+curl -s localhost:5301/api/evaluate \
   -H 'content-type: application/json' \
   -d '{
     "state": "Charged twice again!! Second month in a row.",
@@ -486,7 +486,7 @@ into that refusal.
 ### `GET /api/health`
 
 ```bash
-curl -s localhost:8080/api/health
+curl -s localhost:5301/api/health
 ```
 
 ```json
