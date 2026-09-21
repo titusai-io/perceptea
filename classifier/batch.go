@@ -284,7 +284,7 @@ func (e *Evaluator) EvaluateBatch(ctx context.Context, req BatchRequest) (BatchR
 			totalOut += out
 			continue
 		}
-		out := parallelEvaluation(req.Questions, w.results, issued)
+		out := parallelEvaluation(req.Questions, w.results, issued, e.softmaxT())
 		r.Answers = out.answers
 		r.Usage = usage(out.inputTokens, out.outputTokens)
 		totalIn += out.inputTokens

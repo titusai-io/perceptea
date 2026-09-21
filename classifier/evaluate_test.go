@@ -111,10 +111,19 @@ func (s *constantScorer) callCount() int {
 // implementation's output — a golden recorded from the code under test would
 // agree with that code however wrong it was. The working:
 //
-//	scoresToDistribution([0.62, 0.55, 0.30]) → [0.497, 0.372, 0.131] at 3dp, confidence 0.561
-//	scoresToDistribution([0.20, 0.55, 0.50]) → [0.101, 0.494, 0.404] at 3dp,
-//	                                            score 1.303370786516854 → 1.3, confidence 0.542
-//	round3(0.7123) → 0.712
+//	scoresToDistribution([0.62, 0.55, 0.30], 1) → [0.497073, 0.372359, 0.130568]
+//	                                              at 6dp, confidence 0.560893
+//	scoresToDistribution([0.20, 0.55, 0.50], 1) → [0.101124, 0.494382, 0.404494]
+//	                                              at 6dp,
+//	                                              score 1.3033707865168538 → 1.3,
+//	                                              confidence 0.542135
+//	round6(0.7123) → 0.7123
+//
+// The probabilities and confidences were three decimals until reporting moved
+// to six; the unrounded distributions behind them are unchanged, because the
+// softmax temperature this runs at is 1 and dividing by 1 is the identity. The
+// score keeps two places: a score is a position on a declared scale, not a
+// probability, and nothing about it can be mistaken for a certainty.
 const goldenQuestions = `{
 	"department": {
 		"type": "choice",
@@ -147,12 +156,12 @@ var goldenScript = map[string]float64{
 }
 
 const goldenResponse = `{"model":"probe-1","answers":{` +
-	`"department":{"type":"choice","choice":"billing","confidence":0.561,` +
-	`"probabilities":{"billing":0.497,"technical":0.372,"other":0.131}},` +
-	`"urgency":{"type":"score","score":1.3,"confidence":0.542,` +
+	`"department":{"type":"choice","choice":"billing","confidence":0.560893,` +
+	`"probabilities":{"billing":0.497073,"technical":0.372359,"other":0.130568}},` +
+	`"urgency":{"type":"score","score":1.3,"confidence":0.542135,` +
 	`"legend":{"0":"Low","1":"Medium","2":"High"},` +
-	`"probabilities":{"0":0.101,"1":0.494,"2":0.404}},` +
-	`"angry":{"type":"noul","noul":0.712}},` +
+	`"probabilities":{"0":0.101124,"1":0.494382,"2":0.404494}},` +
+	`"angry":{"type":"noul","noul":0.7123}},` +
 	`"usage":{"input_tokens":21,"output_tokens":7},` +
 	`"meta":{"mode":"parallel","latency_ms":250,"parallel_calls":7}}`
 
@@ -230,8 +239,10 @@ func TestEvaluateRendersAJSONState(t *testing.T) {
 // likely options resolve to the one declared first, so the same request always
 // returns the same option key.
 func TestEvaluateChoiceTieGoesToTheFirstKey(t *testing.T) {
-	// scoresToDistribution([0.6, 0.6, 0.2]) → [0.462, 0.462, 0.077] at 3dp,
-	// confidence 0.481.
+	// scoresToDistribution([0.6, 0.6, 0.2], 1) → [0.461538, 0.461538, 0.076923]
+	// at 6dp, confidence 0.480769. The first two are equal before rounding as
+	// well as after — the scores are identical — so this is a real tie and not
+	// one the reporting invented.
 	script := map[string]float64{
 		`The correct select the best label for "department" is "zeta".`:  0.6,
 		`The correct select the best label for "department" is "alpha".`: 0.6,
@@ -253,10 +264,10 @@ func TestEvaluateChoiceTieGoesToTheFirstKey(t *testing.T) {
 	if answer.Choice != "zeta" {
 		t.Errorf("choice = %q, want the first declared key of the tie, %q", answer.Choice, "zeta")
 	}
-	if answer.Confidence != 0.481 {
-		t.Errorf("confidence = %v, want 0.481", answer.Confidence)
+	if answer.Confidence != 0.480769 {
+		t.Errorf("confidence = %v, want 0.480769", answer.Confidence)
 	}
-	wantProbs := map[string]float64{"zeta": 0.462, "alpha": 0.462, "omega": 0.077}
+	wantProbs := map[string]float64{"zeta": 0.461538, "alpha": 0.461538, "omega": 0.076923}
 	for key, want := range wantProbs {
 		if got, _ := answer.Probabilities.Get(key); got != want {
 			t.Errorf("probability of %q = %v, want %v", key, got, want)
@@ -268,17 +279,24 @@ func TestEvaluateChoiceTieGoesToTheFirstKey(t *testing.T) {
 }
 
 // TestEvaluateChoiceArgmaxUsesTheUnroundedDistribution pins that the winner is
-// picked before the reported probabilities are rounded. The scores are the
-// reviewer's counterexample:
-// scoresToDistribution([0.6621435702969297, 0.25532241168893255, 0.6623438199044465])
-// is [0.459592550006466, 0.08040325978330291, 0.4600041902102311], which is
-// [0.46, 0.08, 0.46] at three places. The third option wins by 4.1e-4; on the
-// rounded numbers the first and third tie and the tie goes to the first.
+// picked before the reported probabilities are rounded.
+//
+// The scores are a counterexample rebuilt for six decimals. The reviewer's
+// original one separated the two leaders by 4.1e-4, which three decimals
+// flattened into a tie and six report apart, so at the new precision it no
+// longer distinguishes anything: it passes whether the argmax is taken before
+// or after rounding. These scores put the leaders 4.5e-8 apart instead.
+//
+// scoresToDistribution([0.5744669624608281, 0.23147521650098238,
+// 0.574466986906295], 1) is [0.44982071193981865, 0.10035853113828926,
+// 0.44982075692189205], which is [0.449821, 0.100359, 0.449821] at six
+// places. The third option wins; on the rounded numbers the first and third
+// tie and the tie goes to the first.
 func TestEvaluateChoiceArgmaxUsesTheUnroundedDistribution(t *testing.T) {
 	script := map[string]float64{
-		`The correct select the best label for "pick" is "first".`:  0.6621435702969297,
-		`The correct select the best label for "pick" is "second".`: 0.25532241168893255,
-		`The correct select the best label for "pick" is "third".`:  0.6623438199044465,
+		`The correct select the best label for "pick" is "first".`:  0.5744669624608281,
+		`The correct select the best label for "pick" is "second".`: 0.23147521650098238,
+		`The correct select the best label for "pick" is "third".`:  0.574466986906295,
 	}
 
 	resp, err := New(&scriptedScorer{t: t, script: script}).Evaluate(context.Background(), Request{
@@ -293,7 +311,7 @@ func TestEvaluateChoiceArgmaxUsesTheUnroundedDistribution(t *testing.T) {
 	if answer.Choice != "third" {
 		t.Errorf("choice = %q, want %q: the winner is decided before rounding", answer.Choice, "third")
 	}
-	for key, want := range map[string]float64{"first": 0.46, "second": 0.08, "third": 0.46} {
+	for key, want := range map[string]float64{"first": 0.449821, "second": 0.100359, "third": 0.449821} {
 		if got, _ := answer.Probabilities.Get(key); got != want {
 			t.Errorf("probability of %q = %v, want %v", key, got, want)
 		}
@@ -301,15 +319,20 @@ func TestEvaluateChoiceArgmaxUsesTheUnroundedDistribution(t *testing.T) {
 }
 
 // TestEvaluateConfidenceUsesTheUnroundedDistribution is the same guard for the
-// other consumer of the distribution.
-// scoresToDistribution([0.8955256084507027, 0.6417578224374444, 0.550816362448886])
-// is [0.7396180358263467, 0.15457305449749714, 0.10580890967615618], whose
-// confidence is 0.912. Recomputed from [0.74, 0.155, 0.106] it is 0.913.
+// other consumer of the distribution, and its scores were rebuilt for six
+// decimals for the same reason: the old triple's two confidences agree once
+// the distribution is reported to six places, so it could no longer tell the
+// two orders of operations apart.
+//
+// scoresToDistribution([0.72500192, 0.4072496, 0.73644896], 1) is
+// [0.43093946024142732, 0.11230409152642162, 0.45675644823215111], whose
+// confidence is 0.491287. Recomputed from the reported
+// [0.430939, 0.112304, 0.456756] it is 0.491286.
 func TestEvaluateConfidenceUsesTheUnroundedDistribution(t *testing.T) {
 	script := map[string]float64{
-		`The correct select the best label for "pick" is "first".`:  0.8955256084507027,
-		`The correct select the best label for "pick" is "second".`: 0.6417578224374444,
-		`The correct select the best label for "pick" is "third".`:  0.550816362448886,
+		`The correct select the best label for "pick" is "first".`:  0.72500192,
+		`The correct select the best label for "pick" is "second".`: 0.4072496,
+		`The correct select the best label for "pick" is "third".`:  0.73644896,
 	}
 
 	resp, err := New(&scriptedScorer{t: t, script: script}).Evaluate(context.Background(), Request{
@@ -321,11 +344,11 @@ func TestEvaluateConfidenceUsesTheUnroundedDistribution(t *testing.T) {
 	}
 
 	answer, _ := resp.Answers.Get("pick")
-	if answer.Confidence != 0.912 {
-		t.Errorf("confidence = %v, want 0.912: 0.913 is what the rounded distribution gives",
+	if answer.Confidence != 0.491287 {
+		t.Errorf("confidence = %v, want 0.491287: 0.491286 is what the rounded distribution gives",
 			answer.Confidence)
 	}
-	for key, want := range map[string]float64{"first": 0.74, "second": 0.155, "third": 0.106} {
+	for key, want := range map[string]float64{"first": 0.430939, "second": 0.112304, "third": 0.456756} {
 		if got, _ := answer.Probabilities.Get(key); got != want {
 			t.Errorf("probability of %q = %v, want %v", key, got, want)
 		}
@@ -963,5 +986,252 @@ func TestRequestJSONRoundTrip(t *testing.T) {
 	}
 	if string(encoded) != want {
 		t.Fatalf("round trip changed the document:\n got %s\nwant %s", encoded, want)
+	}
+}
+
+// ------------------------------------------------- the softmax temperature --
+
+// temperatureQuestions is one choice of three options whose scores genuinely
+// differ, which is what a temperature test needs: equal scores are uniform at
+// every temperature and three options redistribute mass visibly where two
+// only trade it.
+const temperatureQuestions = `{
+	"pick": {"type": "choice", "criteria": {"high": "", "middle": "", "low": ""}}
+}`
+
+// temperatureScript scores the three options 0.9, 0.6 and 0.2.
+var temperatureScript = map[string]float64{
+	`The correct select the best label for "pick" is "high".`:   0.9,
+	`The correct select the best label for "pick" is "middle".`: 0.6,
+	`The correct select the best label for "pick" is "low".`:    0.2,
+}
+
+// pickProbabilities runs the shared fixture through an Evaluator built with
+// opts and returns the answer it reported.
+func pickProbabilities(t *testing.T, opts ...Option) Answer {
+	t.Helper()
+	resp, err := New(&scriptedScorer{t: t, script: temperatureScript}, opts...).
+		Evaluate(context.Background(), Request{
+			State:     StringState("s"),
+			Questions: mustQuestions(t, temperatureQuestions),
+		})
+	if err != nil {
+		t.Fatalf("Evaluate returned %v", err)
+	}
+	answer, ok := resp.Answers.Get("pick")
+	if !ok {
+		t.Fatal("no answer for the question")
+	}
+	return answer
+}
+
+// probabilitiesOf reads a distribution out in declaration order.
+func probabilitiesOf(t *testing.T, a Answer, keys ...string) []float64 {
+	t.Helper()
+	out := make([]float64, len(keys))
+	for i, key := range keys {
+		p, ok := a.Probabilities.Get(key)
+		if !ok {
+			t.Fatalf("no probability reported for %q", key)
+		}
+		out[i] = p
+	}
+	return out
+}
+
+// TestEvaluateDefaultSoftmaxTemperatureIsTheIdentity pins the default at 1 and
+// pins what 1 reports, so a default that drifted would be caught by the
+// numbers and not only by the constant.
+//
+//	scoresToDistribution([0.9, 0.6, 0.2], 1) = [0.83720930232558155,
+//	0.1395348837209302, 0.023255813953488379] → [0.837209, 0.139535, 0.023256]
+func TestEvaluateDefaultSoftmaxTemperatureIsTheIdentity(t *testing.T) {
+	if DefaultSoftmaxTemperature != 1 {
+		t.Fatalf("DefaultSoftmaxTemperature = %v, want 1: the default has to be the identity "+
+			"so that no existing deployment's numbers move", DefaultSoftmaxTemperature)
+	}
+	if got := New(nil).SoftmaxTemperature(); got != 1 {
+		t.Fatalf("an Evaluator built with no options normalises at %v, want 1", got)
+	}
+
+	want := []float64{0.837209, 0.139535, 0.023256}
+	byDefault := probabilitiesOf(t, pickProbabilities(t), "high", "middle", "low")
+	if !equalFloats(byDefault, want) {
+		t.Fatalf("with no option the distribution is %v, want %v", byDefault, want)
+	}
+	// Asking for 1 explicitly has to give the very same bits.
+	explicit := probabilitiesOf(t,
+		pickProbabilities(t, WithSoftmaxTemperature(1)), "high", "middle", "low")
+	if !equalFloats(explicit, byDefault) {
+		t.Fatalf("temperature 1 gave %v where the default gave %v; they must agree to the bit",
+			explicit, byDefault)
+	}
+}
+
+// TestEvaluateSoftmaxTemperatureReachesTheDistribution is the whole point of
+// the option: a configured temperature has to arrive at the softmax, not just
+// be parsed and stored. A different temperature must produce a different
+// distribution — and the same choice, because it cannot reorder anything.
+//
+//	scoresToDistribution([0.9, 0.6, 0.2], 5.04) = [0.45621217132150665,
+//	0.31972145323729606, 0.22406637544119723] → [0.456212, 0.319721, 0.224066]
+func TestEvaluateSoftmaxTemperatureReachesTheDistribution(t *testing.T) {
+	const fitted = 5.04
+
+	hot := pickProbabilities(t, WithSoftmaxTemperature(fitted))
+	cold := pickProbabilities(t)
+
+	wantHot := []float64{0.456212, 0.319721, 0.224066}
+	gotHot := probabilitiesOf(t, hot, "high", "middle", "low")
+	if !equalFloats(gotHot, wantHot) {
+		t.Fatalf("at temperature %v the distribution is %v, want %v", fitted, gotHot, wantHot)
+	}
+
+	gotCold := probabilitiesOf(t, cold, "high", "middle", "low")
+	if equalFloats(gotHot, gotCold) {
+		t.Fatalf("temperature %v reported the same distribution as the default, %v: "+
+			"the configured value never reached the softmax", fitted, gotCold)
+	}
+	// Flatter, in every direction: the winner gives mass up and both losers
+	// take it.
+	if !(gotHot[0] < gotCold[0] && gotHot[1] > gotCold[1] && gotHot[2] > gotCold[2]) {
+		t.Fatalf("a higher temperature gave %v against the default's %v, which is not flatter",
+			gotHot, gotCold)
+	}
+
+	// And the answer itself is untouched, which is what makes the knob safe.
+	if hot.Choice != cold.Choice || hot.Choice != "high" {
+		t.Fatalf("choice at temperature %v is %q and at the default %q; want %q either way",
+			fitted, hot.Choice, cold.Choice, "high")
+	}
+	if hot.Confidence == cold.Confidence {
+		t.Fatalf("confidence is %v at both temperatures; it is computed from the "+
+			"distribution and should have moved with it", hot.Confidence)
+	}
+}
+
+// TestEvaluateSoftmaxTemperatureReachesAScoreQuestion is the same check for
+// the other question type that normalises, since each builds its distribution
+// on its own line.
+func TestEvaluateSoftmaxTemperatureReachesAScoreQuestion(t *testing.T) {
+	script := map[string]float64{
+		`On the scale for "How urgent is this?", the most appropriate rating is level 0: "Low".`:    0.2,
+		`On the scale for "How urgent is this?", the most appropriate rating is level 1: "Medium".`: 0.55,
+		`On the scale for "How urgent is this?", the most appropriate rating is level 2: "High".`:   0.5,
+	}
+	questions := `{"urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["Low", "Medium", "High"]}}`
+
+	run := func(opts ...Option) Answer {
+		t.Helper()
+		resp, err := New(&scriptedScorer{t: t, script: script}, opts...).
+			Evaluate(context.Background(), Request{
+				State:     StringState("s"),
+				Questions: mustQuestions(t, questions),
+			})
+		if err != nil {
+			t.Fatalf("Evaluate returned %v", err)
+		}
+		a, _ := resp.Answers.Get("urgency")
+		return a
+	}
+
+	base := run()
+	warm := run(WithSoftmaxTemperature(5.04))
+	if equalFloats(
+		probabilitiesOf(t, base, "0", "1", "2"),
+		probabilitiesOf(t, warm, "0", "1", "2"),
+	) {
+		t.Fatal("a score question reported the same distribution at both temperatures: " +
+			"the configured value never reached its softmax")
+	}
+	if base.Score == warm.Score {
+		t.Fatalf("the expected value is %v at both temperatures, though the distribution it "+
+			"is taken over changed", base.Score)
+	}
+}
+
+// TestWithSoftmaxTemperatureIgnoresWhatIsNotATemperature pins the option's
+// side of the contract. The configuration loader refuses these at startup;
+// a library caller who passes one gets the default rather than an Evaluator
+// that reports NaN for every probability it will ever produce.
+func TestWithSoftmaxTemperatureIgnoresWhatIsNotATemperature(t *testing.T) {
+	for _, bad := range []float64{0, -1, -0.0001, math.NaN(), math.Inf(1)} {
+		e := New(nil, WithSoftmaxTemperature(bad))
+		if got := e.SoftmaxTemperature(); got != DefaultSoftmaxTemperature {
+			t.Errorf("WithSoftmaxTemperature(%v) left the temperature at %v, want the default %v",
+				bad, got, DefaultSoftmaxTemperature)
+		}
+	}
+	// A small positive value is a temperature and is kept, even though the
+	// softmax will floor it: the option's job is to reject what is not a
+	// temperature, not to second-guess one.
+	if got := New(nil, WithSoftmaxTemperature(0.01)).SoftmaxTemperature(); got != 0.01 {
+		t.Errorf("WithSoftmaxTemperature(0.01) gave %v, want 0.01", got)
+	}
+}
+
+// TestEvaluatorBuiltAsALiteralStillNormalisesAtTheDefault covers the zero
+// value. An Evaluator assembled as a struct literal has a zero temperature,
+// which the softmax would floor to 0.05 and report a near one-hot distribution
+// from.
+func TestEvaluatorBuiltAsALiteralStillNormalisesAtTheDefault(t *testing.T) {
+	literal := &Evaluator{scorer: &scriptedScorer{t: t, script: temperatureScript}}
+	resp, err := literal.Evaluate(context.Background(), Request{
+		State:     StringState("s"),
+		Questions: mustQuestions(t, temperatureQuestions),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned %v", err)
+	}
+	answer, _ := resp.Answers.Get("pick")
+	want := []float64{0.837209, 0.139535, 0.023256}
+	if got := probabilitiesOf(t, answer, "high", "middle", "low"); !equalFloats(got, want) {
+		t.Fatalf("a zero-valued Evaluator reported %v, want the default temperature's %v", got, want)
+	}
+}
+
+// TestEvaluateReportsNoCertainty is the end-to-end form of the reporting
+// property: a model that saturated every score still produces an answer whose
+// every published number can be fed back through a log.
+func TestEvaluateReportsNoCertainty(t *testing.T) {
+	script := map[string]float64{
+		`The correct select the best label for "pick" is "yes".`: 1,
+		`The correct select the best label for "pick" is "no".`:  0,
+	}
+	resp, err := New(&scriptedScorer{t: t, script: script}).Evaluate(context.Background(), Request{
+		State:     StringState("s"),
+		Questions: mustQuestions(t, `{"pick": {"type": "choice", "criteria": {"yes": "", "no": ""}}}`),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned %v", err)
+	}
+	answer, _ := resp.Answers.Get("pick")
+	for _, key := range []string{"yes", "no"} {
+		p, _ := answer.Probabilities.Get(key)
+		if p == 0 || p == 1 {
+			t.Errorf("probability of %q is %v; the estimator clamps its inputs to "+
+				"(0.001, 0.999) and can never mean a certainty", key, p)
+		}
+	}
+	if want := 0.999999; func() float64 { p, _ := answer.Probabilities.Get("yes"); return p }() != want {
+		p, _ := answer.Probabilities.Get("yes")
+		t.Errorf("probability of the winner is %v, want %v", p, want)
+	}
+
+	// A noul is the one reported probability that may be 0 or 1: it is the
+	// scorer's own number, with no softmax between it and the wire. What the
+	// finer rounding buys there is that a number just short of 1 stays just
+	// short of it.
+	noul, err := New(&scriptedScorer{t: t, script: map[string]float64{`The proposition "almost" is true.`: 0.9996}}).
+		Evaluate(context.Background(), Request{
+			State:     StringState("s"),
+			Questions: mustQuestions(t, `{"almost": {"type": "noul"}}`),
+		})
+	if err != nil {
+		t.Fatalf("Evaluate returned %v", err)
+	}
+	a, _ := noul.Answers.Get("almost")
+	if a.Noul != 0.9996 {
+		t.Errorf("noul = %v, want 0.9996 reported as itself and not rounded up to 1", a.Noul)
 	}
 }

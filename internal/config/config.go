@@ -8,6 +8,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ const (
 	EnvModel                   = "PERCEPTEA_MODEL"
 	EnvReasoningEffort         = "PERCEPTEA_REASONING_EFFORT"
 	EnvTemperature             = "PERCEPTEA_TEMPERATURE"
+	EnvSoftmaxTemperature      = "PERCEPTEA_SOFTMAX_TEMPERATURE"
 	EnvMaxConcurrency          = "PERCEPTEA_MAX_CONCURRENCY"
 	EnvRequestTimeout          = "PERCEPTEA_REQUEST_TIMEOUT"
 	EnvMaxBodyBytes            = "PERCEPTEA_MAX_BODY_BYTES"
@@ -49,8 +51,16 @@ const (
 	// "Choosing a model".
 	DefaultModel = "mistralai/Mistral-Small-24B-Instruct-2501"
 	// DefaultTemperature is 0 because it is the only setting that makes a
-	// classification reproducible.
+	// classification reproducible. This is the *sampling* temperature, sent
+	// to the provider; DefaultSoftmaxTemperature below is the other one.
 	DefaultTemperature = 0.0
+	// DefaultSoftmaxTemperature is 1, the identity: the softmax over a
+	// question's candidate logits divides by 1 and nothing moves. A fitted
+	// value calibrates better, but it is fitted to one model on one task, so
+	// the default has to be the transform that leaves every existing
+	// deployment's numbers exactly where they were. See the README's
+	// "The softmax temperature".
+	DefaultSoftmaxTemperature = 1.0
 	// DefaultMaxConcurrency bounds the micro-calls one evaluation may have in
 	// flight at once.
 	DefaultMaxConcurrency = 8
@@ -128,8 +138,23 @@ type Config struct {
 	// because it is a property of the model the operator chose and not of
 	// the question being asked.
 	ReasoningEffort string
-	// Temperature is the default sampling temperature.
+	// Temperature is the default sampling temperature: what the provider is
+	// told, so how the model draws its tokens. PERCEPTEA_TEMPERATURE sets it,
+	// and a request body may override it.
 	Temperature float64
+	// SoftmaxTemperature is the softmax temperature the classifier
+	// normalises one question's candidate scores at, so how sharp or how
+	// flat a reported distribution is. PERCEPTEA_SOFTMAX_TEMPERATURE sets it,
+	// and a request body cannot: it is a calibration property of the model
+	// the operator chose, and letting a caller change it would change what a
+	// threshold means from one request to the next.
+	//
+	// It is not Temperature above and has nothing to do with it. One is sent
+	// to the provider; this one is never sent anywhere. It cannot change any
+	// answer either way — dividing a question's logits by one positive
+	// number is monotone, so no argmax moves — only how confident the numbers
+	// beside that answer read.
+	SoftmaxTemperature float64
 	// MaxConcurrency bounds in-flight scoring calls per evaluation.
 	MaxConcurrency int
 	// RequestTimeout bounds one HTTP request end to end.
@@ -191,6 +216,7 @@ func LoadFrom(env func(string) string) (Config, error) {
 		BaseURL:                 DefaultInferenceBaseURL,
 		Model:                   DefaultModel,
 		Temperature:             DefaultTemperature,
+		SoftmaxTemperature:      DefaultSoftmaxTemperature,
 		MaxConcurrency:          DefaultMaxConcurrency,
 		RequestTimeout:          DefaultRequestTimeout,
 		MaxBodyBytes:            DefaultMaxBodyBytes,
@@ -244,6 +270,25 @@ func LoadFrom(env func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s: %q is not a number", EnvTemperature, v)
 		}
 		cfg.Temperature = f
+	}
+
+	// The softmax floors its divisor, so a value it cannot honour would be
+	// quietly replaced rather than refused. It is caught here instead, like
+	// every other malformed setting: an operator who wrote 0 meant something
+	// by it, and serving them 0.05 without a word is the one outcome that
+	// teaches them nothing. A NaN is refused by the same test — ParseFloat
+	// accepts the word, and a NaN temperature would turn every probability
+	// and confidence of every answer into a NaN the encoder then refuses,
+	// failing whole responses for a setting nobody would think to suspect.
+	if v := get(EnvSoftmaxTemperature); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %q is not a number", EnvSoftmaxTemperature, v)
+		}
+		if !(f > 0) || math.IsInf(f, 1) {
+			return Config{}, fmt.Errorf("%s: must be a finite positive number, got %v", EnvSoftmaxTemperature, f)
+		}
+		cfg.SoftmaxTemperature = f
 	}
 
 	if v := get(EnvMaxConcurrency); v != "" {

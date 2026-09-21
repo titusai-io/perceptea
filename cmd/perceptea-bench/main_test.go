@@ -423,7 +423,7 @@ func TestBenchEvaluatorLetsTheThrottleBeTheOnlyBound(t *testing.T) {
 	// mistaken for each other.
 	const limit = classifier.DefaultMaxConcurrency + 4
 	scorer := &countingScorer{started: make(chan struct{}, limit), release: make(chan struct{})}
-	evaluator := benchEvaluator(scorer, limit)
+	evaluator := benchEvaluator(scorer, limit, config.DefaultSoftmaxTemperature)
 
 	// One case, one choice question with `limit` options, so the whole
 	// fan-out belongs to a single evaluation.
@@ -530,5 +530,26 @@ func TestWriteEmitsTextByDefaultAndJSONOnRequest(t *testing.T) {
 	}
 	if back.Dataset != report.Dataset || back.Calibration.ECE != report.Calibration.ECE {
 		t.Errorf("decoded report = %+v, want the same numbers as %+v", back, report)
+	}
+}
+
+// TestBenchEvaluatorCarriesTheConfiguredSoftmaxTemperature: the benchmark is
+// the tool the temperature is fitted with, so a run that normalised at the
+// default while the environment named another would be measuring the
+// calibration of a configuration nobody is serving — and would report the
+// fitted value as no improvement on itself.
+func TestBenchEvaluatorCarriesTheConfiguredSoftmaxTemperature(t *testing.T) {
+	scorer := &countingScorer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	for _, tc := range []struct{ in, want float64 }{
+		{5.04, 5.04},
+		{config.DefaultSoftmaxTemperature, config.DefaultSoftmaxTemperature},
+		// Not a temperature: the loader refuses one, and the evaluator falls
+		// back rather than reporting NaN for every probability.
+		{0, classifier.DefaultSoftmaxTemperature},
+	} {
+		got := benchEvaluator(scorer, 4, tc.in).SoftmaxTemperature()
+		if got != tc.want {
+			t.Errorf("benchEvaluator(..., %v) normalises at %v, want %v", tc.in, got, tc.want)
+		}
 	}
 }

@@ -147,6 +147,11 @@ func (s *Server) resolveSettings(w http.ResponseWriter, r *http.Request, body re
 			ReasoningEffort: s.cfg.ReasoningEffort,
 			Scorer:          s.cfg.Scorer,
 			MaxConcurrency:  s.cfg.MaxConcurrency,
+			// Server-side only for the same reason, and note that it is not
+			// the temperature resolved just above: that one is sampling and
+			// goes to the provider, this one is the softmax the answers are
+			// normalised through on the way back.
+			SoftmaxTemperature: s.cfg.SoftmaxTemperature,
 		},
 		model:       model,
 		temperature: temperature,

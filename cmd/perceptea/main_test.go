@@ -165,6 +165,9 @@ func TestStartupLineReportsTheReasoningEffortOnlyWhenSet(t *testing.T) {
 				ReasoningEffort: tc.effort,
 				RequestTimeout:  60 * time.Second,
 				MaxConcurrency:  8,
+				// Not the default, so the line is shown to carry the
+				// configured value and not a constant.
+				SoftmaxTemperature: 5.04,
 			}
 
 			var buf bytes.Buffer
@@ -188,6 +191,13 @@ func TestStartupLineReportsTheReasoningEffortOnlyWhenSet(t *testing.T) {
 			}
 			if entry["max_concurrency"] != float64(8) {
 				t.Errorf("max_concurrency = %v", entry["max_concurrency"])
+			}
+			// The softmax temperature scales every probability and
+			// confidence the process will report, so an operator comparing
+			// two deployments has to be able to see which one each was
+			// normalised at.
+			if entry["softmax_temperature"] != float64(5.04) {
+				t.Errorf("softmax_temperature = %v, want 5.04", entry["softmax_temperature"])
 			}
 		})
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -704,4 +705,53 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// The softmax temperature is the operator's, like the reasoning effort and
+// the scorer: it is what every reported probability is calibrated by, and a
+// caller who could change it between two requests would change what a
+// threshold means. It has to reach the evaluator's settings from the
+// configuration and from nowhere else.
+func TestEvaluateSettingsCarryTheConfiguredSoftmaxTemperature(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.SoftmaxTemperature = 5.04 })
+	if w := h.post(validBody); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if got := h.settings().SoftmaxTemperature; got != 5.04 {
+		t.Errorf("Settings.SoftmaxTemperature = %v, want 5.04", got)
+	}
+}
+
+// The batch endpoint resolves its settings on its own line, so it gets its
+// own check rather than being assumed to follow.
+func TestBatchSettingsCarryTheConfiguredSoftmaxTemperature(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.SoftmaxTemperature = 5.04 })
+	if w := h.postBatch(sampleBatchBody); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if got := h.settings().SoftmaxTemperature; got != 5.04 {
+		t.Errorf("Settings.SoftmaxTemperature = %v, want 5.04", got)
+	}
+}
+
+// A Config that names no softmax temperature — a zero value, or one a caller
+// assembled in Go and left out — takes the default rather than the zero,
+// which the softmax would floor to 0.05 and report a near one-hot
+// distribution from. NaN takes it too: the loader refuses one, but this
+// struct is exported.
+func TestNewServerDefaultsTheSoftmaxTemperature(t *testing.T) {
+	for _, bad := range []float64{0, -1, math.NaN()} {
+		h := newHarness(t, func(c *config.Config) { c.SoftmaxTemperature = bad })
+		if got := h.server.Config().SoftmaxTemperature; got != config.DefaultSoftmaxTemperature {
+			t.Errorf("a configured %v resolved to %v, want the default %v",
+				bad, got, config.DefaultSoftmaxTemperature)
+		}
+		if w := h.post(validBody); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if got := h.settings().SoftmaxTemperature; got != config.DefaultSoftmaxTemperature {
+			t.Errorf("a configured %v reached the evaluator as %v, want the default %v",
+				bad, got, config.DefaultSoftmaxTemperature)
+		}
+	}
 }

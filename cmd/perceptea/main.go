@@ -156,6 +156,13 @@ func startupAttrs(cfg config.Config, addr string) []slog.Attr {
 		slog.Bool("allow_request_credentials", cfg.AllowRequestCredentials),
 		slog.Duration("request_timeout", cfg.RequestTimeout),
 		slog.Int("max_concurrency", cfg.MaxConcurrency),
+		// Always, not only when it is not the default: it scales every
+		// probability and confidence the process will report, so an
+		// operator comparing two deployments' numbers needs to see which
+		// one each was normalised at. It is the softmax temperature and
+		// not the sampling one, which is a property of a request rather
+		// than of the process and is not on this line at all.
+		slog.Float64("softmax_temperature", cfg.SoftmaxTemperature),
 	)
 }
 

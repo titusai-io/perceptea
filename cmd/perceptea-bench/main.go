@@ -10,9 +10,12 @@
 // It makes real calls to a real endpoint and needs a real key, so it is a
 // tool and not a test. Everything it needs beyond the dataset comes from the
 // environment that configures the server itself — the endpoint, the model,
-// the key, the temperature, the scorer, PERCEPTEA_MAX_CONCURRENCY and
+// the key, both temperatures, the scorer, PERCEPTEA_MAX_CONCURRENCY and
 // PERCEPTEA_REQUEST_TIMEOUT — so a benchmark run measures the configuration
-// you are actually serving. A .env file in the working directory is read
+// you are actually serving. Both temperatures, because there are two and
+// they are unrelated: PERCEPTEA_TEMPERATURE is the sampling one the provider
+// is told, and PERCEPTEA_SOFTMAX_TEMPERATURE is what the answers are
+// normalised through afterwards — the setting this tool exists to fit. A .env file in the working directory is read
 // first, as it is for the server.
 //
 // Interrupting a run prints the report for the attempts that did finish and
@@ -116,7 +119,7 @@ func liveEvaluator(cfg config.Config, logger *slog.Logger) (calibration.Evaluato
 	if err != nil {
 		return nil, err
 	}
-	return benchEvaluator(client, cfg.MaxConcurrency), nil
+	return benchEvaluator(client, cfg.MaxConcurrency, cfg.SoftmaxTemperature), nil
 }
 
 // benchEvaluator puts the configured ceiling on the scorer, where every call
@@ -127,10 +130,16 @@ func liveEvaluator(cfg config.Config, logger *slog.Logger) (calibration.Evaluato
 // evaluation, so leaving it at its default would hold a single case below the
 // configured number however high that number was set. With the throttle in
 // place it is the only bound, which is the point.
-func benchEvaluator(scorer classifier.Scorer, maxConcurrency int) *classifier.Evaluator {
+// PERCEPTEA_SOFTMAX_TEMPERATURE is passed straight through, and has to be:
+// it is what the reported probabilities are normalised at, so a benchmark
+// run without it would measure the calibration of a configuration nobody is
+// serving. It is the one setting this tool exists to fit — sweep it, and read
+// the negative log likelihood and the calibration error off the report.
+func benchEvaluator(scorer classifier.Scorer, maxConcurrency int, softmaxTemperature float64) *classifier.Evaluator {
 	return classifier.New(
 		calibration.Throttle(scorer, maxConcurrency),
 		classifier.WithMaxConcurrency(0),
+		classifier.WithSoftmaxTemperature(softmaxTemperature),
 	)
 }
 

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/titusai-io/perceptea/classifier"
+	"github.com/titusai-io/perceptea/internal/config"
 	"github.com/titusai-io/perceptea/provider/inference"
 )
 
@@ -345,5 +347,44 @@ func TestPooledTransportRaisesTheHostLimit(t *testing.T) {
 	}
 	if tr.IdleConnTimeout != 90*time.Second {
 		t.Errorf("IdleConnTimeout = %s", tr.IdleConnTimeout)
+	}
+}
+
+// TestDefaultEvaluatorFactoryAppliesTheSoftmaxTemperature checks the last
+// step of the plumbing: the factory builds the classifier, and the settings
+// it was handed have to arrive as the option that changes every probability
+// the evaluator will report. Nothing downstream of here can tell the
+// difference between a temperature that was dropped and one that was never
+// configured, so it is checked on the evaluator itself.
+func TestDefaultEvaluatorFactoryAppliesTheSoftmaxTemperature(t *testing.T) {
+	f, _ := countingFactory(t)
+
+	for _, tc := range []struct {
+		name string
+		in   float64
+		want float64
+	}{
+		{"configured", 5.04, 5.04},
+		{"absent takes the default", 0, config.DefaultSoftmaxTemperature},
+		{"a negative takes the default", -3, config.DefaultSoftmaxTemperature},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, err := f.newEvaluator(Settings{
+				APIKey:             testKey,
+				BaseURL:            "https://inference.example/v1",
+				Model:              "probe-1",
+				SoftmaxTemperature: tc.in,
+			})
+			if err != nil {
+				t.Fatalf("building an evaluator: %v", err)
+			}
+			built, ok := ev.(*classifier.Evaluator)
+			if !ok {
+				t.Fatalf("the factory returned a %T, want a *classifier.Evaluator", ev)
+			}
+			if got := built.SoftmaxTemperature(); got != tc.want {
+				t.Errorf("the evaluator normalises at %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

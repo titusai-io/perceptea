@@ -27,6 +27,10 @@ services:
       PERCEPTEA_MODEL: ${PERCEPTEA_MODEL:-mistralai/Mistral-Small-24B-Instruct-2501}
       PERCEPTEA_REASONING_EFFORT: ${PERCEPTEA_REASONING_EFFORT:-}
       PERCEPTEA_TEMPERATURE: ${PERCEPTEA_TEMPERATURE:-0}
+      # The other temperature, and an unrelated one: the divisor the
+      # candidate logits are softmaxed at, never sent to the provider. 1 is
+      # the identity.
+      PERCEPTEA_SOFTMAX_TEMPERATURE: ${PERCEPTEA_SOFTMAX_TEMPERATURE:-1}
       PERCEPTEA_MAX_CONCURRENCY: ${PERCEPTEA_MAX_CONCURRENCY:-8}
       PERCEPTEA_REQUEST_TIMEOUT: ${PERCEPTEA_REQUEST_TIMEOUT:-60s}
       PERCEPTEA_MAX_BODY_BYTES: ${PERCEPTEA_MAX_BODY_BYTES:-2097152}

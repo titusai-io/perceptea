@@ -25,6 +25,13 @@ const minTemperature = 0.05
 
 // softmax normalises logits into a distribution summing to one.
 //
+// The temperature here is the **softmax** temperature: how sharply this
+// package normalises one question's candidate scores against each other. It
+// has nothing to do with the sampling temperature a request or
+// PERCEPTEA_TEMPERATURE sends to the provider, which decides how the model
+// draws its tokens and never reaches this file. One is how the model answers;
+// this one is how the answers are turned into a distribution.
+//
 // The temperature is floored at [minTemperature]. The maximum is subtracted
 // before exponentiating, which leaves the result unchanged mathematically and
 // keeps large-magnitude logits from overflowing to +Inf. An empty input gives
@@ -34,9 +41,10 @@ const minTemperature = 0.05
 // maximum makes one term exp(0) == 1 exactly, so a non-empty input always sums
 // to at least 1, and an empty one has already returned.
 //
-// scoresToDistribution is the only caller and always passes a temperature of 1;
-// the parameter is kept so the transform stays the general one rather than
-// having that single value baked into it.
+// A single temperature divides every logit by the same positive number, which
+// is monotone: it cannot reorder the logits and so cannot move an argmax. That
+// is the property that makes [WithSoftmaxTemperature] a safe knob — it changes
+// how confident an answer reads, never which answer it is.
 func softmax(logits []float64, temperature float64) []float64 {
 	out := make([]float64, len(logits))
 	if len(logits) == 0 {
@@ -73,21 +81,49 @@ const (
 
 // scoresToDistribution turns independently estimated probabilities into one
 // distribution: each score is clamped into (0,1), mapped to its logit, and the
-// logits are softmaxed at temperature 1.
+// logits are softmaxed at the given softmax temperature — [DefaultSoftmaxTemperature]
+// unless the operator configured another, and never the sampling temperature
+// the provider was called with.
 //
 // The scores come from separate calls and do not sum to anything in
 // particular; this is what makes them comparable.
-func scoresToDistribution(scores []float64) []float64 {
+func scoresToDistribution(scores []float64, temperature float64) []float64 {
 	logits := make([]float64, len(scores))
 	for i, p := range scores {
 		clamped := math.Min(logitClampHigh, math.Max(logitClampLow, p))
 		logits[i] = math.Log(clamped / (1 - clamped))
 	}
-	return softmax(logits, 1)
+	return softmax(logits, temperature)
 }
 
-// round3 rounds to three decimal places, as every reported probability is.
-func round3(x float64) float64 { return math.Round(x*1000) / 1000 }
+// round6 rounds to six decimal places, as every reported probability and
+// confidence is.
+//
+// Six, and not three, because a rounding must never turn a number this package
+// can produce into one it cannot. The scores entering [scoresToDistribution]
+// are clamped to (0.001, 0.999), so the widest logit gap two candidates can
+// open is 2·ln(0.999/0.001) = 13.8135…, and the most extreme probability
+// reachable — one candidate at the top clamp, one at the bottom, at
+// [DefaultSoftmaxTemperature] — is 999²/(999²+1) = 0.9999989979980001. Three
+// decimals report that as exactly 1 and five still do; six report 0.999999.
+// A reported 1 would be a certainty the estimator is built never to claim, and
+// it is also a dead end for a caller: nobody can re-normalise or re-temper a
+// published distribution through log(0).
+//
+// The bottom end cannot be pinned the same way, and is not papered over. The
+// smallest probability a question of n candidates can reach at temperature 1
+// is 1/(1+(n-1)·999²): 1.002e-6 for two candidates, 3.34e-7 for four,
+// 3.94e-9 for the 255 a choice may declare. Six decimals report the first two
+// as 0.000001 and everything from four saturated candidates upward as 0. That
+// zero is the rounding's, not the value's — the value is small, never zero —
+// and it is accepted rather than chased: reaching it needs three or more
+// candidates the model scored at 0.999 while scoring another at 0.001, which
+// is a model contradicting itself, and no fixed number of decimals survives
+// the case anyway. A configured softmax temperature below 1 sharpens the
+// distribution without bound and moves both ends: under about 0.95 even the
+// top end rounds to 1 again. Temperatures at or above 1 — the default, and
+// every fitted value measured so far — keep the guarantee.
+func round6(x float64) float64 { return math.Round(x*1e6) / 1e6 }
 
 // round2 rounds to two decimal places, as a score is.
 func round2(x float64) float64 { return math.Round(x*100) / 100 }
@@ -121,8 +157,14 @@ func sanitiseProbability(p float64) float64 {
 
 // confidence scores how decisive a distribution is: half the winning
 // probability plus half of its margin over the runner-up, offset so that a
-// two-way coin flip lands at 0.5. The result is rounded to three places and
-// clamped to [0,1] — a near-certain winner overshoots 1 before clamping.
+// two-way coin flip lands at 0.5. The result is rounded to six places by
+// [round6], for the reason given there, and clamped to [0,1].
+//
+// A confidence of exactly 1 is still reachable, and is not the rounding's
+// doing: the expression overshoots 1 outright for a decisive winner — the most
+// extreme two-candidate distribution puts it at 1.2499984969969999 — and the
+// clamp brings it back. That 1 is a value this package computed, so reporting
+// it claims nothing it cannot support.
 //
 // A missing top or runner-up counts as 0, so an empty distribution scores 0.25
 // and a single candidate scores 1. The input is not modified.
@@ -142,7 +184,7 @@ func confidence(probs []float64) float64 {
 	// No FMA barrier is needed here: multiplying by 0.5 only changes the
 	// exponent, so both halves are exact and a fused multiply-add cannot
 	// round differently from a separate multiply and add.
-	return clamp01(round3(0.5*top1 + 0.5*(gap+0.5)))
+	return clamp01(round6(0.5*top1 + 0.5*(gap+0.5)))
 }
 
 // argmax reports the index of the largest value, the earliest one on an exact

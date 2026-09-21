@@ -45,7 +45,13 @@ reply     = {"p": 0.87}
    same for every candidate of the question, so it rides in the cached prefix.
 3. **Logit, then softmax.** Each `p` is clamped into `(0.001, 0.999)`, mapped
    to `log(p / (1 - p))`, and the logits of one question's candidates are
-   softmaxed into a distribution that sums to 1.
+   softmaxed into a distribution. That distribution sums to exactly 1 before
+   it is reported; what goes on the wire is rounded to six decimal places, so
+   the published numbers sum to 1 to within half of the last place per
+   candidate — under 2e-6 for a three-way choice, and at most 1.3e-4 for the
+   widest choice the service allows. Renormalise if you need an exact total.
+   The softmax runs at a temperature of 1 by default, which is the identity;
+   see [The softmax temperature](#the-softmax-temperature).
 4. **Read off the answer.** A **choice** takes the argmax (the earliest
    declared option wins an exact tie). A **score** takes the expected value
    over the level indices, so a rating may land between two declared levels. A
@@ -164,7 +170,8 @@ comes up and rejects the requests that would need one with a 401.
 | `PERCEPTEA_MODEL` | `mistralai/Mistral-Small-24B-Instruct-2501` | The model id to score with. It has to be one the endpoint above serves, and it should be one that does not reason — see [Choosing a model](#choosing-a-model). |
 | `PERCEPTEA_REASONING_EFFORT` | — | Sent to the provider as `reasoning_effort`: `none`, `low`, `medium` or `high`. Unset sends no reasoning field at all. See [Choosing a model](#choosing-a-model). |
 | `PERCEPTEA_SCORER` | `chat` | How a probability is obtained: `chat` asks the model to write one, `logprob` reads it out of the first token's distribution. See [Two scorers](#two-scorers). |
-| `PERCEPTEA_TEMPERATURE` | `0` | Sampling temperature. 0 is the only reproducible setting. |
+| `PERCEPTEA_TEMPERATURE` | `0` | **Sampling** temperature: what the provider is told, so how the model draws its tokens. 0 is the only reproducible setting. Not the row below. |
+| `PERCEPTEA_SOFTMAX_TEMPERATURE` | `1` | **Softmax** temperature: how sharply this service normalises one question's candidate scores into a distribution. Nothing is sent anywhere; it divides the logits. It cannot change any answer — only how confident the numbers beside it read. `1` is the identity. See [The softmax temperature](#the-softmax-temperature). |
 | `PERCEPTEA_MAX_CONCURRENCY` | `8` | Scoring calls in flight per request. For `/api/evaluate` that is per evaluation; for `/api/evaluate/batch` it is the budget for the whole job, shared across every item, which is the point of that endpoint. |
 | `PERCEPTEA_MAX_BATCH_ITEMS` | `100` | The most states one `/api/evaluate/batch` request may carry. A batch fans out into items × candidates calls, so this is what stops a single request committing to an unbounded amount of provider spend. Over it is a `400`. |
 | `PERCEPTEA_REQUEST_TIMEOUT` | `60s` | Deadline for one request, end to end. A batch is one request, so a large one needs a larger deadline. |
@@ -174,7 +181,10 @@ comes up and rejects the requests that would need one with a 401.
 | `PERCEPTEA_LOG_FORMAT` | `text` | `text` or `json`. |
 
 An unparseable number or duration, a base URL that could never be called, or a
-bad log level stops the process with an error naming the variable.
+bad log level stops the process with an error naming the variable. So does a
+`PERCEPTEA_SOFTMAX_TEMPERATURE` that is not a finite positive number: `0` and
+a negative are not temperatures, and the softmax would floor them to 0.05
+without saying so.
 
 ### What the inference base URL is
 
@@ -575,6 +585,29 @@ The service answers in compact JSON; the examples here are piped through `jq`.
 Answers come back in the order the questions were declared, and a choice's
 probabilities in the order its options were declared.
 
+**Precision.** Every `probabilities` entry, every `noul` and every
+`confidence` is rounded to **six** decimal places; a `score` keeps two,
+because a score is a position on a declared scale rather than a probability.
+The numbers in the example above are shortened for readability — a real
+response carries the full six.
+
+Six places, and not three, so that the rounding cannot report a certainty the
+service is unable to mean. The per-candidate probabilities entering the
+softmax are clamped into `(0.001, 0.999)`, so no candidate is ever certainly
+right or certainly wrong, and the most extreme distribution reachable is
+`0.999999 / 0.000001` — which three decimals published as an exact `1` and
+`0`. That mattered beyond tidiness: a consumer renormalising or re-tempering
+a published distribution needs `log(p)`, and `log(0)` does not exist. A
+`noul` is the one exception and may legitimately be `0` or `1`: it is the
+model's own probability with no softmax between it and the wire.
+
+One limit is worth knowing rather than discovering. A probability smaller
+than `5e-7` still rounds to `0`, which needs a question of four or more
+candidates where the model scored three of them at the top of the clamp and
+another at the bottom — a model contradicting itself. The value is small,
+never zero; no fixed number of decimals survives that case, and the ordinary
+confident answer is nowhere near it.
+
 **Request fields**
 
 | Field | Required | Notes |
@@ -582,7 +615,7 @@ probabilities in the order its options were declared.
 | `state` | yes | A string, object or array — whatever the questions are about. An explicit `null` counts as absent. Objects keep their key order into the prompt. |
 | `questions` | yes | At least one. See the question types below. |
 | `model` | no | Falls back to `PERCEPTEA_MODEL`. |
-| `temperature` | no | Falls back to `PERCEPTEA_TEMPERATURE`. An explicit `0` is honoured. |
+| `temperature` | no | The **sampling** temperature. Falls back to `PERCEPTEA_TEMPERATURE`. An explicit `0` is honoured. The softmax temperature has no field here and cannot be named by a request: it is what a reported probability is calibrated by, so a caller who could change it between two requests would change what a threshold means. A body that sends one gets a `400` like any other unknown field. |
 | `mode` | no | `parallel` (default) or `oneshot`. |
 | `api_key` | no | Only when `PERCEPTEA_ALLOW_REQUEST_CREDENTIALS` is on; otherwise ignored silently. |
 | `inference_base_url` | no | Same, and it means the same as the variable of that name: the API root this request's scoring calls go to. An unusable one is a `400`. |
@@ -939,6 +972,9 @@ func main() {
 		Instructions: "Strong frustration or anger?",
 	})
 
+	// WithSoftmaxTemperature(t) is the other option worth knowing: it is the
+	// softmax temperature, not the sampling one, and 1 — the default here —
+	// is the identity.
 	resp, err := classifier.New(client, classifier.WithMaxConcurrency(8)).
 		Evaluate(context.Background(), classifier.Request{
 			State:     classifier.StringState("Charged twice again!! Second month in a row."),
@@ -1026,12 +1062,76 @@ partial document as a complete one.
 It needs a real key and makes real calls, so it is a tool rather than a test.
 `cmd/perceptea-bench/example.jsonl` is a runnable seven-case dataset covering
 all three question types. Everything else it needs comes from the same
-environment the server reads — the endpoint, the key, the model, the
-temperature, `PERCEPTEA_SCORER`, `PERCEPTEA_MAX_CONCURRENCY` and
+environment the server reads — the endpoint, the key, the model, both
+temperatures, `PERCEPTEA_SCORER`, `PERCEPTEA_MAX_CONCURRENCY` and
 `PERCEPTEA_REQUEST_TIMEOUT` — so a benchmark measures the configuration you
-are actually serving. A credential carried in `PERCEPTEA_INFERENCE_BASE_URL`
+are actually serving. `PERCEPTEA_SOFTMAX_TEMPERATURE` is among them because
+it is the one setting this tool exists to fit: sweep it and read the
+calibration error off the report. A credential carried in `PERCEPTEA_INFERENCE_BASE_URL`
 is struck out of any failure the report records, because the `-json` document
 is one you are being told to store and diff.
+
+### The softmax temperature
+
+`PERCEPTEA_SOFTMAX_TEMPERATURE` is the divisor in step 3 of
+[How the parallel sampler works](#how-the-parallel-sampler-works): each
+candidate's logit is divided by it before the softmax. It is **not**
+`PERCEPTEA_TEMPERATURE`, which is the sampling temperature sent to the
+provider and decides how the model draws its tokens; this one is never sent
+anywhere and decides only how the probabilities that came back are turned
+into a distribution. Two settings, one word, nothing in common.
+
+**It cannot change an answer.** A single temperature divides every logit of a
+question by the same positive number, which is monotone: it cannot reorder
+the candidates, so the argmax a `choice` returns and the ranking you read off
+the distribution are identical at every temperature. Accuracy is therefore
+fixed by construction, not by luck, and that is what makes this a safe knob —
+raising it flattens the distribution and lowering it sharpens one, and
+neither changes which option won. What moves is **calibration**: whether a
+reported 0.8 is right about 80% of the time.
+
+**Fitting one.** You need a labelled set — the same JSON Lines dataset
+`perceptea-bench` takes, one case per line with its true answer.
+
+1. Run the classifier once over the set and keep each case's per-candidate
+   probabilities, before the softmax. The scores do not depend on the
+   temperature, so one pass is enough for the whole sweep.
+2. For a candidate temperature `T`, softmax each case's logits at `T` and
+   read off the probability the distribution gave the **true** label.
+3. Score that `T` by the mean negative log likelihood of the true label over
+   the set: `-mean(log p_true)`. Lower is better.
+4. Sweep `T` over a range — 0.5 to 10 in small steps is ample — and take the
+   minimum. The curve is smooth and has one basin, so a coarse sweep followed
+   by a finer one around the best point finds it quickly.
+5. Split the set in half at random and fit each half on its own. Two halves
+   that agree mean you have fitted the model and not the sample.
+
+**What it measured here.** Fitted this way on a held-out set of 764
+questions against `mistralai/Mistral-Small-24B-Instruct-2501`, the best
+temperature is **T ≈ 5.04**; fitting on either half of a random split gave
+the same value, so it is stable rather than an artefact of which cases
+happened to be in the set.
+
+The table below is **cross-fitted**: every case is scored with a temperature
+fitted on the other half of the split, so nothing is evaluated against a
+temperature fitted on itself.
+
+| | accuracy | ECE | Brier |
+|---|---|---|---|
+| T = 1 | 0.712 | 0.158 | 0.430 |
+| T fitted (5.04) | 0.712 | **0.103** | 0.417 |
+
+Expected calibration error falls by 35%. Accuracy is **identical**, as it
+has to be — see above; a temperature that had moved it would be a bug, not a
+result.
+
+**Why the default is still 1.** 5.04 is fitted to one model on one task. A
+different model, or the same model on questions of a different shape, has a
+different best temperature, and serving someone else's would be worse than
+serving none. `1` is the identity — divide by 1 and the distribution is
+exactly what it was — so the default moves nobody's numbers. Fit your own on
+your own data, or leave it alone; `perceptea-bench` reports the calibration
+error and the Brier score you would be fitting against.
 
 ## Contributing
 

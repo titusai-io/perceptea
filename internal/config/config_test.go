@@ -38,6 +38,7 @@ func TestLoadFromDefaults(t *testing.T) {
 		Model:                   "mistralai/Mistral-Small-24B-Instruct-2501",
 		ReasoningEffort:         "",
 		Temperature:             0,
+		SoftmaxTemperature:      1,
 		MaxConcurrency:          8,
 		RequestTimeout:          60 * time.Second,
 		MaxBodyBytes:            2097152,
@@ -116,6 +117,7 @@ func TestLoadFromEveryVariable(t *testing.T) {
 		"PERCEPTEA_MODEL":                     "some/model",
 		"PERCEPTEA_REASONING_EFFORT":          "medium",
 		"PERCEPTEA_TEMPERATURE":               "0.25",
+		"PERCEPTEA_SOFTMAX_TEMPERATURE":       "5.04",
 		"PERCEPTEA_MAX_CONCURRENCY":           "32",
 		"PERCEPTEA_REQUEST_TIMEOUT":           "90s",
 		"PERCEPTEA_MAX_BODY_BYTES":            "4096",
@@ -133,6 +135,7 @@ func TestLoadFromEveryVariable(t *testing.T) {
 		Model:                   "some/model",
 		ReasoningEffort:         "medium",
 		Temperature:             0.25,
+		SoftmaxTemperature:      5.04,
 		MaxConcurrency:          32,
 		RequestTimeout:          90 * time.Second,
 		MaxBodyBytes:            4096,
@@ -222,6 +225,18 @@ func TestLoadFromWhitespaceOnlyValuesFallBackToDefaults(t *testing.T) {
 	}
 }
 
+// A positive softmax temperature is accepted whatever its size, including
+// one smaller than the floor the softmax itself applies. The line between
+// accepted and refused is meaning, not magnitude: 0 and a negative are not
+// temperatures at all, while 0.001 is one the transform will treat as 0.05 —
+// a sharpening the operator asked for, taken as far as it goes.
+func TestLoadFromAcceptsAnySmallPositiveSoftmaxTemperature(t *testing.T) {
+	cfg := loadWith(t, map[string]string{"PERCEPTEA_SOFTMAX_TEMPERATURE": "  0.001  "})
+	if cfg.SoftmaxTemperature != 0.001 {
+		t.Errorf("SoftmaxTemperature = %v, want 0.001 trimmed and parsed", cfg.SoftmaxTemperature)
+	}
+}
+
 func TestLoadFromErrors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -232,6 +247,47 @@ func TestLoadFromErrors(t *testing.T) {
 		wantIn []string
 	}{
 		{"bad temperature", map[string]string{"PERCEPTEA_TEMPERATURE": "warm"}, "PERCEPTEA_TEMPERATURE", nil},
+		// The softmax temperature is refused where the sampling temperature
+		// above is not: 0 and a negative are meaningless to a softmax, and
+		// the transform would floor them to 0.05 without saying so. The
+		// message has to name the variable and not just "temperature" —
+		// there are two, and an operator who mixed them up learns nothing
+		// from a message that could be about either.
+		{
+			"bad softmax temperature",
+			map[string]string{"PERCEPTEA_SOFTMAX_TEMPERATURE": "warm"},
+			"PERCEPTEA_SOFTMAX_TEMPERATURE",
+			[]string{`"warm"`},
+		},
+		{
+			"zero softmax temperature",
+			map[string]string{"PERCEPTEA_SOFTMAX_TEMPERATURE": "0"},
+			"PERCEPTEA_SOFTMAX_TEMPERATURE",
+			[]string{"positive"},
+		},
+		{
+			"negative softmax temperature",
+			map[string]string{"PERCEPTEA_SOFTMAX_TEMPERATURE": "-2"},
+			"PERCEPTEA_SOFTMAX_TEMPERATURE",
+			[]string{"positive"},
+		},
+		// ParseFloat accepts both of these words, so neither is caught by
+		// the "is not a number" branch. A NaN divisor turns every
+		// probability and confidence of every answer into a NaN that
+		// json.Marshal then refuses, so the whole response fails on a
+		// setting nobody would think to suspect.
+		{
+			"a softmax temperature of NaN",
+			map[string]string{"PERCEPTEA_SOFTMAX_TEMPERATURE": "NaN"},
+			"PERCEPTEA_SOFTMAX_TEMPERATURE",
+			[]string{"positive"},
+		},
+		{
+			"an infinite softmax temperature",
+			map[string]string{"PERCEPTEA_SOFTMAX_TEMPERATURE": "Inf"},
+			"PERCEPTEA_SOFTMAX_TEMPERATURE",
+			[]string{"positive"},
+		},
 		{"bad concurrency", map[string]string{"PERCEPTEA_MAX_CONCURRENCY": "lots"}, "PERCEPTEA_MAX_CONCURRENCY", nil},
 		{"zero concurrency", map[string]string{"PERCEPTEA_MAX_CONCURRENCY": "0"}, "PERCEPTEA_MAX_CONCURRENCY", nil},
 		{"bad timeout", map[string]string{"PERCEPTEA_REQUEST_TIMEOUT": "soon"}, "PERCEPTEA_REQUEST_TIMEOUT", nil},
