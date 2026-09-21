@@ -102,7 +102,7 @@ func NewServer(opts Options) (*Server, error) {
 	// bare path that catches every other method. The mux's own 405 answers in
 	// text/plain, and a client that is promised one error shape for every
 	// failure should not have to parse prose for two of them. With the
-	// path-only patterns in place nothing depends on the automatic 405 any
+	// path-only patterns in place, nothing depends on the automatic 405 any
 	// more, so a "/" catch-all can render the 404 in the same shape.
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/evaluate", s.handleEvaluate)
@@ -140,7 +140,7 @@ func (s *Server) Config() config.Config { return s.cfg }
 // request gets a deadline and exactly one log line.
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// requestScope carries what the log line needs but only the handler knows.
+// requestScope carries what the log line needs, but only the handler knows.
 type requestScope struct {
 	questions int
 	mode      string
@@ -200,7 +200,7 @@ func (s *Server) withRequestScope(next http.Handler) http.Handler {
 			if v := recover(); v != nil {
 				// http.ErrAbortHandler is the one panic value that means
 				// "drop this connection deliberately"; net/http expects to
-				// see it itself, and suppresses its own stack for it. The log
+				// see it itself and suppresses its own stack for it. The log
 				// line is written first so that the request is still counted.
 				if v == http.ErrAbortHandler {
 					s.logRequest(ctx, r, rec, scope, start)
