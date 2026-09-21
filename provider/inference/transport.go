@@ -1,4 +1,4 @@
-package openai
+package inference
 
 import (
 	"bytes"
@@ -56,7 +56,7 @@ type APIError struct {
 // Error implements error. It never contains the API key.
 func (e *APIError) Error() string {
 	var b strings.Builder
-	b.WriteString("openai: http ")
+	b.WriteString("inference: http ")
 	b.WriteString(strconv.Itoa(e.StatusCode))
 	if e.Message != "" {
 		b.WriteString(": ")
@@ -88,7 +88,7 @@ func (e *nonRetryable) Unwrap() error { return e.err }
 func (c *Client) complete(ctx context.Context, body chatRequest) (*chatResponse, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("openai: encode request: %w", err)
+		return nil, fmt.Errorf("inference: encode request: %w", err)
 	}
 	endpoint := c.baseURL + completionsPath
 	attempts := c.maxRetries + 1
@@ -107,7 +107,7 @@ func (c *Client) complete(ctx context.Context, body chatRequest) (*chatResponse,
 			return nil, err
 		}
 		if serr := c.sleep(ctx, backoffFor(attempt, err)); serr != nil {
-			return nil, fmt.Errorf("openai: retry abandoned: %w (last attempt: %w)", serr, last)
+			return nil, fmt.Errorf("inference: retry abandoned: %w (last attempt: %w)", serr, last)
 		}
 	}
 	return nil, last
@@ -117,7 +117,7 @@ func (c *Client) complete(ctx context.Context, body chatRequest) (*chatResponse,
 func (c *Client) attempt(ctx context.Context, endpoint string, payload []byte, model string, attempt int) (*chatResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return nil, &nonRetryable{fmt.Errorf("openai: build request: %w", err)}
+		return nil, &nonRetryable{fmt.Errorf("inference: build request: %w", err)}
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -132,15 +132,15 @@ func (c *Client) attempt(ctx context.Context, endpoint string, payload []byte, m
 	start := time.Now()
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		c.log.DebugContext(ctx, "openai: chat completion failed",
+		c.log.DebugContext(ctx, "inference: chat completion failed",
 			"model", model,
 			"attempt", attempt+1,
 			"latency_ms", time.Since(start).Milliseconds())
-		return nil, fmt.Errorf("openai: chat completion: %w", err)
+		return nil, fmt.Errorf("inference: chat completion: %w", err)
 	}
 	defer drain(resp)
 
-	c.log.DebugContext(ctx, "openai: chat completion",
+	c.log.DebugContext(ctx, "inference: chat completion",
 		"model", model,
 		"attempt", attempt+1,
 		"status", resp.StatusCode,
@@ -152,7 +152,7 @@ func (c *Client) attempt(ctx context.Context, endpoint string, payload []byte, m
 
 	var out chatResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReadBody)).Decode(&out); err != nil {
-		return nil, &nonRetryable{fmt.Errorf("openai: decode response: %w", err)}
+		return nil, &nonRetryable{fmt.Errorf("inference: decode response: %w", err)}
 	}
 	return &out, nil
 }
@@ -267,8 +267,8 @@ type errorDetail struct {
 }
 
 // flexString decodes a JSON string, number, boolean or null into text, because
-// "code" in particular comes back as a string from OpenAI and as a number from
-// several gateways.
+// "code" in particular comes back as a string from some endpoints and as a
+// number from others.
 type flexString string
 
 // UnmarshalJSON implements [json.Unmarshaler]. It never returns an error.

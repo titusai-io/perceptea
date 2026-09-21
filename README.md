@@ -354,11 +354,11 @@ import (
 	"os"
 
 	"github.com/titusai-io/perceptea/classifier"
-	"github.com/titusai-io/perceptea/provider/openai"
+	"github.com/titusai-io/perceptea/provider/inference"
 )
 
 func main() {
-	client, err := openai.New(openai.Config{
+	client, err := inference.New(inference.Config{
 		APIKey:  os.Getenv("PERCEPTEA_API_KEY"),
 		BaseURL: "https://api.deepinfra.com/v1/openai",
 		Model:   "zai-org/GLM-5.3-Flash",

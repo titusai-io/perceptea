@@ -1,4 +1,4 @@
-package openai
+package inference
 
 import (
 	"bytes"
@@ -16,6 +16,12 @@ import (
 // testKey is the only API key used anywhere in these tests. It is deliberately
 // distinctive so that a leak assertion can search for it.
 const testKey = "sk-test-DO-NOT-LEAK-6f2a1c"
+
+// testBaseURL stands in for a configured endpoint wherever a test needs a
+// valid one but makes no call. The .example TLD is reserved for documentation
+// and cannot resolve, so a test that started calling it would fail rather than
+// reach a stranger.
+const testBaseURL = "https://inference.example/v1"
 
 // capturedRequest is one request as the fake endpoint saw it.
 type capturedRequest struct {

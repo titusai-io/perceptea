@@ -9,9 +9,9 @@ func TestValidateBaseURL(t *testing.T) {
 	for _, tc := range []struct {
 		name, raw, wantIn string
 	}{
-		{"an https URL", "https://api.openai.com/v1", ""},
+		{"an https URL", "https://inference.example/v1", ""},
 		{"an http URL", "http://localhost:11434/v1", ""},
-		{"padded", "  https://api.openai.com/v1  ", ""},
+		{"padded", "  https://inference.example/v1  ", ""},
 		{"no scheme", "openrouter.ai/api/v1", "absolute http or https"},
 		{"wrong scheme", "ftp://openrouter.ai/v1", "absolute http or https"},
 		{"scheme only", "https://", "host"},
@@ -42,7 +42,7 @@ func TestValidateBaseURL(t *testing.T) {
 
 func TestDisplayBaseURL(t *testing.T) {
 	for _, tc := range []struct{ name, raw, want string }{
-		{"nothing to strip", "https://api.openai.com/v1", "https://api.openai.com/v1"},
+		{"nothing to strip", "https://inference.example/v1", "https://inference.example/v1"},
 		{
 			"a key in the userinfo",
 			"https://svc:sk-secret-0123456789@internal.example/v1",

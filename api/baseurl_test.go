@@ -73,7 +73,7 @@ func TestEvaluateIgnoresABadBaseURLWhenCredentialsAreLocked(t *testing.T) {
 	if w := h.post(withBaseURL("not a url")); w.Code != 200 {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
 	}
-	if got := h.settings().BaseURL; got != "https://api.openai.com/v1" {
+	if got := h.settings().BaseURL; got != "https://inference.example/v1" {
 		t.Errorf("BaseURL = %q, want the configured one", got)
 	}
 }
@@ -87,7 +87,7 @@ func TestEvaluateCallsAnyUsableBaseURLTheCallerNames(t *testing.T) {
 		"https://anywhere.example/v1",
 		"http://192.168.1.50:8000/v1",
 		"http://127.0.0.1:11434/v1",
-		"https://api.openai.com:8443/v1",
+		"https://inference.example:8443/v1",
 		"HTTPS://Mixed.Case.example/v1",
 	} {
 		t.Run(baseURL, func(t *testing.T) {

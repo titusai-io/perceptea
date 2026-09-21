@@ -1,6 +1,11 @@
-// Package openai speaks to any OpenAI-compatible /chat/completions endpoint —
-// OpenAI itself, OpenRouter, DeepInfra, Z.ai, a local vLLM — and implements the
-// [classifier.Scorer] and [classifier.Generator] interfaces on top of it.
+// Package inference speaks the OpenAI-compatible /chat/completions protocol
+// and implements the [classifier.Scorer] and [classifier.Generator] interfaces
+// on top of it.
+//
+// That protocol is a wire format rather than a product: DeepInfra, OpenRouter,
+// Z.ai and local servers such as Ollama and vLLM all expose it, and any of
+// them can be the endpoint. Which one is a matter of configuration — the
+// caller always names it, and this package has no opinion about the answer.
 //
 // The package depends only on the standard library: the request and response
 // documents are hand-rolled JSON structs rather than a vendored SDK.
@@ -9,7 +14,7 @@
 // evaluation fans out into many simultaneous Score calls against the same
 // client. The only mutable state is the negotiated structured-output level,
 // which is held in an atomic and only ever moves in the degrading direction.
-package openai
+package inference
 
 import (
 	"context"
@@ -33,12 +38,13 @@ var (
 )
 
 // ErrNoAPIKey is returned by [New] when Config.APIKey is blank.
-var ErrNoAPIKey = errors.New("openai: no API key configured")
+var ErrNoAPIKey = errors.New("inference: no API key configured")
+
+// ErrNoBaseURL is returned by [New] when Config.BaseURL is blank. There is no
+// default endpoint: nothing here picks a service on the operator's behalf.
+var ErrNoBaseURL = errors.New("inference: no base URL configured")
 
 const (
-	// defaultBaseURL is OpenAI's own endpoint, used when Config.BaseURL is
-	// blank.
-	defaultBaseURL = "https://api.openai.com/v1"
 	// defaultMaxRetries is the number of retries — not attempts — used when
 	// Config.MaxRetries is zero.
 	defaultMaxRetries = 2
@@ -47,13 +53,14 @@ const (
 	defaultTimeout = 120 * time.Second
 )
 
-// Config configures a [Client]. Only APIKey is required.
+// Config configures a [Client]. APIKey and BaseURL are required.
 type Config struct {
 	// APIKey is the bearer token for the endpoint. Required.
 	APIKey string
-	// BaseURL is the API root, without the /chat/completions suffix. It
-	// defaults to https://api.openai.com/v1, and trailing slashes are
-	// trimmed so that both forms of a pasted URL work.
+	// BaseURL is the API root, without the /chat/completions suffix.
+	// Required: there is no default endpoint. It must be an absolute http
+	// or https URL, and trailing slashes are trimmed so that both forms of
+	// a pasted URL work.
 	BaseURL string
 	// Model is used for any request that does not name a model of its own.
 	Model string
@@ -76,7 +83,7 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// Client calls an OpenAI-compatible chat completions endpoint. Create one with
+// Client calls one OpenAI-compatible chat completions endpoint. Create one with
 // [New]; the zero value is not usable. It is safe for concurrent use.
 type Client struct {
 	apiKey     string
@@ -100,7 +107,7 @@ type Client struct {
 }
 
 // New validates cfg and returns a ready client. It returns [ErrNoAPIKey] when
-// no key is configured.
+// no key is configured and [ErrNoBaseURL] when no endpoint is.
 func New(cfg Config) (*Client, error) {
 	key := strings.TrimSpace(cfg.APIKey)
 	if key == "" {
@@ -109,17 +116,17 @@ func New(cfg Config) (*Client, error) {
 
 	base := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	if base == "" {
-		base = defaultBaseURL
+		return nil, ErrNoBaseURL
 	}
 	parsed, err := url.Parse(base)
 	if err != nil {
-		return nil, fmt.Errorf("openai: invalid base URL %q: %w", base, err)
+		return nil, fmt.Errorf("inference: invalid base URL %q: %w", base, err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("openai: invalid base URL %q: want an http or https URL", base)
+		return nil, fmt.Errorf("inference: invalid base URL %q: want an http or https URL", base)
 	}
 	if parsed.Host == "" {
-		return nil, fmt.Errorf("openai: invalid base URL %q: no host", base)
+		return nil, fmt.Errorf("inference: invalid base URL %q: no host", base)
 	}
 
 	httpClient := cfg.HTTPClient
@@ -183,7 +190,7 @@ func (c *Client) resolveModel(requested string) (string, error) {
 		model = c.model
 	}
 	if model == "" {
-		return "", errors.New("openai: no model: set Config.Model or name one on the request")
+		return "", errors.New("inference: no model: set Config.Model or name one on the request")
 	}
 	return model, nil
 }

@@ -1,4 +1,4 @@
-package openai
+package inference
 
 import (
 	"bytes"
@@ -140,7 +140,7 @@ func (c *Client) downgrade(to outputLevel) {
 			return
 		}
 		if c.level.CompareAndSwap(current, int32(to)) {
-			c.log.Debug("openai: structured output downgraded",
+			c.log.Debug("inference: structured output downgraded",
 				"from", outputLevel(current).String(),
 				"to", to.String())
 			return

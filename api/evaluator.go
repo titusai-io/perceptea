@@ -12,7 +12,7 @@ import (
 
 	"github.com/titusai-io/perceptea/classifier"
 	"github.com/titusai-io/perceptea/internal/config"
-	"github.com/titusai-io/perceptea/provider/openai"
+	"github.com/titusai-io/perceptea/provider/inference"
 )
 
 const (
@@ -40,7 +40,7 @@ func defaultNewEvaluator(logger *slog.Logger) func(Settings) (Evaluator, error) 
 // It keeps one *http.Client for the life of the server, because evaluations
 // fan out into many small calls to the same host and a fresh client per
 // request would throw away every pooled connection. It keeps the provider
-// clients too: a *openai.Client holds the structured-output level it has
+// clients too: an *inference.Client holds the structured-output level it has
 // negotiated, so that a provider which rejects response_format is discovered
 // once. Rebuilt per request, that discovery was repaid in full on every
 // request — a choice with 8 options cost 23 upstream calls instead of 8.
@@ -50,7 +50,7 @@ type evaluatorFactory struct {
 	cache  *clientCache
 	// newClient builds one provider client. It is a field so that a test can
 	// count how often the factory actually reaches for a new one.
-	newClient func(openai.Config) (*openai.Client, error)
+	newClient func(inference.Config) (*inference.Client, error)
 }
 
 func newEvaluatorFactory(logger *slog.Logger) *evaluatorFactory {
@@ -63,14 +63,14 @@ func newEvaluatorFactory(logger *slog.Logger) *evaluatorFactory {
 			Transport: pooledTransport(),
 		},
 		cache:     newClientCache(maxCachedClients),
-		newClient: openai.New,
+		newClient: inference.New,
 	}
 }
 
 // newEvaluator answers one request's worth of settings.
 func (f *evaluatorFactory) newEvaluator(st Settings) (Evaluator, error) {
-	c, err := f.cache.get(clientKey(st), func() (*openai.Client, error) {
-		return f.newClient(openai.Config{
+	c, err := f.cache.get(clientKey(st), func() (*inference.Client, error) {
+		return f.newClient(inference.Config{
 			APIKey:     st.APIKey,
 			BaseURL:    st.BaseURL,
 			Model:      st.Model,
@@ -120,7 +120,7 @@ type clientCache struct {
 
 type cacheEntry struct {
 	key    string
-	client *openai.Client
+	client *inference.Client
 }
 
 func newClientCache(max int) *clientCache {
@@ -137,7 +137,7 @@ func newClientCache(max int) *clientCache {
 // get returns the client cached under key, building and storing one with
 // build if there is none. A build failure is returned as-is and cached not at
 // all: a missing key must fail every time, not once.
-func (c *clientCache) get(key string, build func() (*openai.Client, error)) (*openai.Client, error) {
+func (c *clientCache) get(key string, build func() (*inference.Client, error)) (*inference.Client, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

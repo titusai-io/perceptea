@@ -55,7 +55,7 @@ func newHarness(t *testing.T, tweak func(*config.Config)) *harness {
 
 	cfg := config.Config{
 		Addr:                    ":0",
-		BaseURL:                 "https://api.openai.com/v1",
+		BaseURL:                 "https://inference.example/v1",
 		APIKey:                  testKey,
 		Model:                   "probe-1",
 		Temperature:             0,
@@ -396,7 +396,7 @@ func TestEvaluateSettingsCarryTheConfiguredLimits(t *testing.T) {
 	if st.APIKey != testKey {
 		t.Errorf("Settings.APIKey = %q, want the configured key", st.APIKey)
 	}
-	if st.BaseURL != "https://api.openai.com/v1" {
+	if st.BaseURL != "https://inference.example/v1" {
 		t.Errorf("Settings.BaseURL = %q, want the configured base URL", st.BaseURL)
 	}
 }

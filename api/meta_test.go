@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/titusai-io/perceptea/internal/config"
-	"github.com/titusai-io/perceptea/provider/openai"
+	"github.com/titusai-io/perceptea/provider/inference"
 )
 
 func TestHealthPayload(t *testing.T) {
@@ -20,7 +20,7 @@ func TestHealthPayload(t *testing.T) {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
 	const want = `{"ok":true,"service":"perceptea",` +
-		`"inference_base_url":"https://api.openai.com/v1","model":"probe-1",` +
+		`"inference_base_url":"https://inference.example/v1","model":"probe-1",` +
 		`"api_key_configured":true}`
 	if got := strings.TrimSpace(w.Body.String()); got != want {
 		t.Errorf("health:\n got %s\nwant %s", got, want)
@@ -100,7 +100,7 @@ func TestTheAPIKeyNeverEscapes(t *testing.T) {
 	record(h.get("/api/health").Body.String())
 
 	// A provider that echoes the key back at us must not be relayed verbatim.
-	h.failWith(&openai.APIError{
+	h.failWith(&inference.APIError{
 		StatusCode: http.StatusUnauthorized,
 		Type:       "invalid_api_key",
 		Message:    "Incorrect API key provided: " + testKey,
@@ -124,7 +124,7 @@ func TestTheAPIKeyNeverEscapes(t *testing.T) {
 func TestTheRequestKeyNeverEscapes(t *testing.T) {
 	const bodyKey = "sk-from-the-body-abcdefghij"
 	h := newHarness(t, nil)
-	h.failWith(&openai.APIError{
+	h.failWith(&inference.APIError{
 		StatusCode: http.StatusUnauthorized,
 		Message:    "Incorrect API key provided: " + bodyKey,
 	})

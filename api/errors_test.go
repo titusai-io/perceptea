@@ -16,7 +16,7 @@ import (
 
 	"github.com/titusai-io/perceptea/classifier"
 	"github.com/titusai-io/perceptea/internal/config"
-	"github.com/titusai-io/perceptea/provider/openai"
+	"github.com/titusai-io/perceptea/provider/inference"
 )
 
 const validBody = `{"state":"s","questions":{"q":{"type":"noul"}}}`
@@ -133,35 +133,35 @@ func TestEvaluateErrorTable(t *testing.T) {
 		},
 		{
 			name:       "no API key",
-			err:        openai.ErrNoAPIKey,
+			err:        inference.ErrNoAPIKey,
 			wantStatus: http.StatusUnauthorized,
 			wantCode:   codeMissingAPIKey,
 		},
 		{
 			name:        "the upstream rate limited us",
-			err:         &openai.APIError{StatusCode: http.StatusTooManyRequests, Type: "rate_limit", Message: "slow down"},
+			err:         &inference.APIError{StatusCode: http.StatusTooManyRequests, Type: "rate_limit", Message: "slow down"},
 			wantStatus:  http.StatusTooManyRequests,
 			wantCode:    codeUpstreamRateLimited,
 			wantMessage: "slow down",
 		},
 		{
 			name:        "the upstream failed",
-			err:         &openai.APIError{StatusCode: http.StatusInternalServerError, Type: "server_error", Message: "boom"},
+			err:         &inference.APIError{StatusCode: http.StatusInternalServerError, Type: "server_error", Message: "boom"},
 			wantStatus:  http.StatusBadGateway,
 			wantCode:    codeUpstreamError,
 			wantMessage: "boom",
 		},
 		{
 			name:       "the upstream refused our credentials",
-			err:        &openai.APIError{StatusCode: http.StatusUnauthorized, Type: "invalid_api_key", Message: "bad key"},
+			err:        &inference.APIError{StatusCode: http.StatusUnauthorized, Type: "invalid_api_key", Message: "bad key"},
 			wantStatus: http.StatusBadGateway,
 			wantCode:   codeUpstreamError,
 		},
 		{
 			name: "a transport failure",
-			err: fmt.Errorf("openai: chat completion: %w", &url.Error{
+			err: fmt.Errorf("inference: chat completion: %w", &url.Error{
 				Op:  "Post",
-				URL: "https://api.openai.com/v1/chat/completions",
+				URL: "https://inference.example/v1/chat/completions",
 				Err: errors.New("dial tcp: connection refused"),
 			}),
 			wantStatus:  http.StatusBadGateway,
@@ -209,9 +209,9 @@ func TestEvaluateErrorTable(t *testing.T) {
 // caller to back off rather than retry now.
 func TestARateLimitBeatsTheDeadlineItRanInto(t *testing.T) {
 	h := newHarness(t, nil)
-	h.failWith(fmt.Errorf("openai: retry abandoned: %w (last attempt: %w)",
+	h.failWith(fmt.Errorf("inference: retry abandoned: %w (last attempt: %w)",
 		context.DeadlineExceeded,
-		&openai.APIError{StatusCode: http.StatusTooManyRequests, Type: "rate_limit", Message: "slow down"}))
+		&inference.APIError{StatusCode: http.StatusTooManyRequests, Type: "rate_limit", Message: "slow down"}))
 
 	message := h.expectError(h.post(validBody), http.StatusTooManyRequests, codeUpstreamRateLimited)
 	if !strings.Contains(message, "slow down") {
@@ -223,9 +223,9 @@ func TestARateLimitBeatsTheDeadlineItRanInto(t *testing.T) {
 // failure, not ours.
 func TestAnUpstreamFailureBeatsTheDeadlineItRanInto(t *testing.T) {
 	h := newHarness(t, nil)
-	h.failWith(fmt.Errorf("openai: retry abandoned: %w (last attempt: %w)",
+	h.failWith(fmt.Errorf("inference: retry abandoned: %w (last attempt: %w)",
 		context.DeadlineExceeded,
-		&openai.APIError{StatusCode: http.StatusBadGateway, Message: "upstream unavailable"}))
+		&inference.APIError{StatusCode: http.StatusBadGateway, Message: "upstream unavailable"}))
 
 	h.expectError(h.post(validBody), http.StatusBadGateway, codeUpstreamError)
 }
@@ -410,7 +410,7 @@ func TestEvaluateAcceptsTrailingWhitespace(t *testing.T) {
 
 func TestEvaluateFactoryErrorsAreClassifiedToo(t *testing.T) {
 	h := newHarness(t, func(c *config.Config) { c.APIKey = "" })
-	h.factoryErr = openai.ErrNoAPIKey
+	h.factoryErr = inference.ErrNoAPIKey
 
 	message := h.expectError(h.post(validBody), http.StatusUnauthorized, codeMissingAPIKey)
 	for _, want := range []string{config.EnvAPIKey, "api_key"} {
@@ -434,7 +434,7 @@ func TestMissingKeyMessageOmitsTheBodyRouteWhenDisallowed(t *testing.T) {
 		c.APIKey = ""
 		c.AllowRequestCredentials = false
 	})
-	h.factoryErr = openai.ErrNoAPIKey
+	h.factoryErr = inference.ErrNoAPIKey
 
 	message := h.expectError(h.post(validBody), http.StatusUnauthorized, codeMissingAPIKey)
 	if strings.Contains(message, "api_key") {
@@ -578,7 +578,7 @@ func TestEvaluateHonoursRequestCredentialsOnlyWhenAllowed(t *testing.T) {
 		if st.APIKey != testKey {
 			t.Errorf("Settings.APIKey = %q, want the configured key", st.APIKey)
 		}
-		if st.BaseURL != "https://api.openai.com/v1" {
+		if st.BaseURL != "https://inference.example/v1" {
 			t.Errorf("Settings.BaseURL = %q, want the configured base URL", st.BaseURL)
 		}
 		if !strings.Contains(h.logs.String(), "ignoring request-supplied credentials") {
@@ -639,7 +639,7 @@ func TestABaseURLCredentialIsScrubbedFromTheLog(t *testing.T) {
 
 	t.Run("the server's own", func(t *testing.T) {
 		h := newHarness(t, func(c *config.Config) { c.BaseURL = gateway })
-		h.failWith(errors.New(`openai: chat completion: Post "https://svc:***@gw.example/v1?key=abc123def/chat/completions": dial tcp: connection refused`))
+		h.failWith(errors.New(`inference: chat completion: Post "https://svc:***@gw.example/v1?key=abc123def/chat/completions": dial tcp: connection refused`))
 
 		h.post(validBody)
 
@@ -656,7 +656,7 @@ func TestABaseURLCredentialIsScrubbedFromTheLog(t *testing.T) {
 
 	t.Run("the caller's", func(t *testing.T) {
 		h := newHarness(t, nil)
-		h.failWith(errors.New(`openai: chat completion: Post "https://theirs.example/v1?token=zzz-secret-999/chat/completions": dial tcp: connection refused`))
+		h.failWith(errors.New(`inference: chat completion: Post "https://theirs.example/v1?token=zzz-secret-999/chat/completions": dial tcp: connection refused`))
 
 		h.post(`{"state":"s","questions":{"q":{"type":"noul"}},"inference_base_url":"https://theirs.example/v1?token=zzz-secret-999"}`)
 
@@ -671,7 +671,7 @@ func TestABaseURLCredentialIsScrubbedFromTheLog(t *testing.T) {
 func TestAShortServerKeyIsStillScrubbedFromAResponse(t *testing.T) {
 	const shortKey = "ollama"
 	h := newHarness(t, func(c *config.Config) { c.APIKey = shortKey })
-	h.failWith(&openai.APIError{
+	h.failWith(&inference.APIError{
 		StatusCode: http.StatusUnauthorized,
 		Message:    "Incorrect API key provided: " + shortKey,
 	})

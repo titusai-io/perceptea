@@ -10,17 +10,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/titusai-io/perceptea/provider/openai"
+	"github.com/titusai-io/perceptea/provider/inference"
 )
 
 // countingFactory is the real factory with a counter over the one step that
 // reaches for a new provider client.
-func countingFactory(t *testing.T) (*evaluatorFactory, *[]openai.Config) {
+func countingFactory(t *testing.T) (*evaluatorFactory, *[]inference.Config) {
 	t.Helper()
 	f := newEvaluatorFactory(slog.New(slog.DiscardHandler))
-	var built []openai.Config
+	var built []inference.Config
 	inner := f.newClient
-	f.newClient = func(cfg openai.Config) (*openai.Client, error) {
+	f.newClient = func(cfg inference.Config) (*inference.Client, error) {
 		built = append(built, cfg)
 		return inner(cfg)
 	}
@@ -33,13 +33,13 @@ func countingFactory(t *testing.T) (*evaluatorFactory, *[]openai.Config) {
 func TestDefaultEvaluatorFactory(t *testing.T) {
 	f, built := countingFactory(t)
 
-	if _, err := f.newEvaluator(Settings{BaseURL: "https://api.openai.com/v1"}); !errors.Is(err, openai.ErrNoAPIKey) {
+	if _, err := f.newEvaluator(Settings{BaseURL: "https://inference.example/v1"}); !errors.Is(err, inference.ErrNoAPIKey) {
 		t.Errorf("building an evaluator without a key = %v, want ErrNoAPIKey", err)
 	}
 
 	ev, err := f.newEvaluator(Settings{
 		APIKey:         testKey,
-		BaseURL:        "https://api.openai.com/v1",
+		BaseURL:        "https://inference.example/v1",
 		Model:          "probe-1",
 		MaxConcurrency: 4,
 	})
@@ -57,7 +57,7 @@ func TestDefaultEvaluatorFactory(t *testing.T) {
 	if got.APIKey != testKey {
 		t.Errorf("Config.APIKey = %q, want the request's key", got.APIKey)
 	}
-	if got.BaseURL != "https://api.openai.com/v1" {
+	if got.BaseURL != "https://inference.example/v1" {
 		t.Errorf("Config.BaseURL = %q", got.BaseURL)
 	}
 	if got.Model != "probe-1" {
@@ -93,7 +93,7 @@ func TestDefaultEvaluatorFactorySharesOneHTTPClient(t *testing.T) {
 	f, built := countingFactory(t)
 
 	for _, key := range []string{testKey, "sk-someone-else-0123456789"} {
-		if _, err := f.newEvaluator(Settings{APIKey: key, BaseURL: "https://api.openai.com/v1", Model: "m"}); err != nil {
+		if _, err := f.newEvaluator(Settings{APIKey: key, BaseURL: "https://inference.example/v1", Model: "m"}); err != nil {
 			t.Fatalf("building an evaluator: %v", err)
 		}
 	}
@@ -121,7 +121,7 @@ func TestDefaultEvaluatorFactorySharesOneHTTPClient(t *testing.T) {
 // choice with 8 options cost 23 upstream calls instead of 8.
 func TestTheProviderClientIsReusedAcrossRequests(t *testing.T) {
 	f, built := countingFactory(t)
-	base := Settings{APIKey: testKey, BaseURL: "https://api.openai.com/v1", Model: "probe-1", MaxConcurrency: 8}
+	base := Settings{APIKey: testKey, BaseURL: "https://inference.example/v1", Model: "probe-1", MaxConcurrency: 8}
 
 	for range 3 {
 		if _, err := f.newEvaluator(base); err != nil {
@@ -146,7 +146,7 @@ func TestTheProviderClientIsReusedAcrossRequests(t *testing.T) {
 	// Anything the client is actually made of does split it.
 	for _, tweak := range []func(*Settings){
 		func(s *Settings) { s.APIKey = "sk-someone-else-0123456789" },
-		func(s *Settings) { s.BaseURL = "https://openrouter.ai/api/v1" },
+		func(s *Settings) { s.BaseURL = "https://other.example/v1" },
 		func(s *Settings) { s.Model = "probe-2" },
 	} {
 		st := base
@@ -167,7 +167,7 @@ func TestTheClientCacheIsBounded(t *testing.T) {
 	f, built := countingFactory(t)
 
 	for i := range maxCachedClients * 3 {
-		st := Settings{APIKey: fmt.Sprintf("sk-caller-%010d", i), BaseURL: "https://api.openai.com/v1", Model: "m"}
+		st := Settings{APIKey: fmt.Sprintf("sk-caller-%010d", i), BaseURL: "https://inference.example/v1", Model: "m"}
 		if _, err := f.newEvaluator(st); err != nil {
 			t.Fatalf("building an evaluator: %v", err)
 		}
@@ -185,13 +185,13 @@ func TestTheClientCacheIsBounded(t *testing.T) {
 // pushed out by a burst of one-off callers.
 func TestTheClientCacheEvictsTheLeastRecentlyUsed(t *testing.T) {
 	f, built := countingFactory(t)
-	mine := Settings{APIKey: testKey, BaseURL: "https://api.openai.com/v1", Model: "m"}
+	mine := Settings{APIKey: testKey, BaseURL: "https://inference.example/v1", Model: "m"}
 
 	if _, err := f.newEvaluator(mine); err != nil {
 		t.Fatalf("building an evaluator: %v", err)
 	}
 	for i := range maxCachedClients - 1 {
-		st := Settings{APIKey: fmt.Sprintf("sk-caller-%010d", i), BaseURL: "https://api.openai.com/v1", Model: "m"}
+		st := Settings{APIKey: fmt.Sprintf("sk-caller-%010d", i), BaseURL: "https://inference.example/v1", Model: "m"}
 		if _, err := f.newEvaluator(st); err != nil {
 			t.Fatalf("building an evaluator: %v", err)
 		}
@@ -203,7 +203,7 @@ func TestTheClientCacheEvictsTheLeastRecentlyUsed(t *testing.T) {
 	built2 := len(*built)
 
 	// One more caller evicts something, and it must not be the one in use.
-	st := Settings{APIKey: "sk-caller-the-last", BaseURL: "https://api.openai.com/v1", Model: "m"}
+	st := Settings{APIKey: "sk-caller-the-last", BaseURL: "https://inference.example/v1", Model: "m"}
 	if _, err := f.newEvaluator(st); err != nil {
 		t.Fatalf("building an evaluator: %v", err)
 	}
@@ -219,12 +219,12 @@ func TestTheClientCacheEvictsTheLeastRecentlyUsed(t *testing.T) {
 // keys is a credential store, and a heap dump is a breach.
 func TestTheCacheKeyDoesNotCarryTheCredential(t *testing.T) {
 	const secret = "sk-plaintext-0123456789"
-	key := clientKey(Settings{APIKey: secret, BaseURL: "https://api.openai.com/v1", Model: "m"})
+	key := clientKey(Settings{APIKey: secret, BaseURL: "https://inference.example/v1", Model: "m"})
 
 	if len(key) != 64 {
 		t.Errorf("key = %q, want a hex sha-256 digest", key)
 	}
-	for _, part := range []string{secret, "https://api.openai.com/v1"} {
+	for _, part := range []string{secret, "https://inference.example/v1"} {
 		if strings.Contains(key, part) {
 			t.Errorf("the cache key contains %q verbatim: %q", part, key)
 		}
@@ -243,11 +243,11 @@ func TestTheClientCacheIsSafeForConcurrentUse(t *testing.T) {
 	f := newEvaluatorFactory(slog.New(slog.DiscardHandler))
 	var mu sync.Mutex
 	var builds int
-	f.newClient = func(cfg openai.Config) (*openai.Client, error) {
+	f.newClient = func(cfg inference.Config) (*inference.Client, error) {
 		mu.Lock()
 		builds++
 		mu.Unlock()
-		return openai.New(cfg)
+		return inference.New(cfg)
 	}
 
 	var wg sync.WaitGroup
@@ -257,7 +257,7 @@ func TestTheClientCacheIsSafeForConcurrentUse(t *testing.T) {
 			defer wg.Done()
 			st := Settings{
 				APIKey:  fmt.Sprintf("sk-caller-%010d", i%4),
-				BaseURL: "https://api.openai.com/v1",
+				BaseURL: "https://inference.example/v1",
 				Model:   "m",
 			}
 			if _, err := f.newEvaluator(st); err != nil {
@@ -277,7 +277,7 @@ func TestTheClientCacheIsSafeForConcurrentUse(t *testing.T) {
 
 func TestDefaultNewEvaluatorUsesTheFactory(t *testing.T) {
 	factory := defaultNewEvaluator(slog.New(slog.DiscardHandler))
-	ev, err := factory(Settings{APIKey: testKey, BaseURL: "https://api.openai.com/v1", Model: "m"})
+	ev, err := factory(Settings{APIKey: testKey, BaseURL: "https://inference.example/v1", Model: "m"})
 	if err != nil {
 		t.Fatalf("building an evaluator: %v", err)
 	}

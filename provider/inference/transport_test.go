@@ -1,13 +1,20 @@
-package openai
+package inference
 
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,7 +25,7 @@ import (
 
 func TestNewRejectsABlankKey(t *testing.T) {
 	for _, key := range []string{"", "   ", "\t\n"} {
-		client, err := New(Config{APIKey: key})
+		client, err := New(Config{APIKey: key, BaseURL: testBaseURL})
 		if !errors.Is(err, ErrNoAPIKey) {
 			t.Errorf("New(%q) error = %v, want ErrNoAPIKey", key, err)
 		}
@@ -28,13 +35,28 @@ func TestNewRejectsABlankKey(t *testing.T) {
 	}
 }
 
+// There is no default endpoint. A blank base URL is a missing setting, not an
+// invitation to pick a service the operator never named, so it fails the same
+// way a missing key does.
+func TestNewRejectsABlankBaseURL(t *testing.T) {
+	for _, base := range []string{"", "   ", "\t\n", "/", "  ///  "} {
+		client, err := New(Config{APIKey: testKey, BaseURL: base})
+		if !errors.Is(err, ErrNoBaseURL) {
+			t.Errorf("New(BaseURL=%q) error = %v, want ErrNoBaseURL", base, err)
+		}
+		if client != nil {
+			t.Errorf("New(BaseURL=%q) returned a client alongside the error", base)
+		}
+	}
+}
+
 func TestNewAppliesDefaults(t *testing.T) {
-	client, err := New(Config{APIKey: testKey})
+	client, err := New(Config{APIKey: testKey, BaseURL: testBaseURL})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if client.baseURL != "https://api.openai.com/v1" {
-		t.Errorf("baseURL = %q, want the OpenAI default", client.baseURL)
+	if client.baseURL != testBaseURL {
+		t.Errorf("baseURL = %q, want the configured root unchanged", client.baseURL)
 	}
 	if client.maxRetries != 2 {
 		t.Errorf("maxRetries = %d, want 2", client.maxRetries)
@@ -70,15 +92,141 @@ func TestNewTrimsTrailingSlashesFromTheBaseURL(t *testing.T) {
 }
 
 func TestNewRejectsAnUnusableBaseURL(t *testing.T) {
-	for _, in := range []string{"api.openai.com/v1", "ftp://example.com", "://nope"} {
+	for _, in := range []string{"inference.example/v1", "ftp://example.com", "://nope"} {
 		if _, err := New(Config{APIKey: testKey, BaseURL: in}); err == nil {
 			t.Errorf("New(%q) succeeded, want an error", in)
 		}
 	}
 }
 
+// Every error this package produces names the package, with the package's own
+// name. That prefix is what an operator reads in a log line and what the HTTP
+// layer forwards as an error detail, so a stale one is a wrong answer rather
+// than a cosmetic slip — and a prefix is exactly the kind of thing a rename
+// misses in one spot. This walks every path that builds an error of its own.
+func TestEveryErrorNamesThePackage(t *testing.T) {
+	const prefix = "inference: "
+
+	check := func(what string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Errorf("%s: want an error", what)
+			return
+		}
+		if got := err.Error(); !strings.HasPrefix(got, prefix) {
+			t.Errorf("%s: error = %q, want it to start with %q", what, got, prefix)
+		}
+	}
+
+	check("ErrNoAPIKey", ErrNoAPIKey)
+	check("ErrNoBaseURL", ErrNoBaseURL)
+
+	for what, base := range map[string]string{
+		"a base URL that will not parse": "://nope",
+		"a base URL with a wrong scheme": "ftp://example.com",
+		"a base URL with no host":        "https:///v1",
+	} {
+		_, err := New(Config{APIKey: testKey, BaseURL: base})
+		check(what, err)
+	}
+
+	// No model on the client and none on the request.
+	quiet := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+	client, _ := newTestClient(t, quiet, func(cfg *Config) { cfg.Model = "" })
+	_, err := client.Score(context.Background(), classifier.ScoreRequest{
+		State:     "the sky is grey",
+		Statement: "It is raining.",
+	})
+	check("no model anywhere", err)
+
+	// A request document that cannot be encoded: NaN is not JSON.
+	client, _ = newTestClient(t, quiet, nil)
+	unencodable := fixtureRequest
+	unencodable.Temperature = math.NaN()
+	_, err = client.Score(context.Background(), unencodable)
+	check("a request that will not encode", err)
+
+	// A non-2xx response. A 401 is final and says nothing about the request
+	// document, so it neither retries nor sends the client probing.
+	refused := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		writeJSON(w, http.StatusUnauthorized, `{"error":{"message":"bad key"}}`)
+	})
+	client, _ = newTestClient(t, refused, nil)
+	_, err = client.Score(context.Background(), fixtureRequest)
+	check("an API error", err)
+
+	// A 200 whose body is not a completion document.
+	client, _ = newTestClient(t, alwaysJSON(t, `{"choices":`), nil)
+	_, err = client.Score(context.Background(), fixtureRequest)
+	check("an undecodable response", err)
+
+	// A transport that never connects.
+	client, _ = newTestClient(t, quiet, func(cfg *Config) {
+		cfg.MaxRetries = -1
+		cfg.HTTPClient = &http.Client{Transport: &flakyTransport{failures: 1, next: http.DefaultTransport}}
+	})
+	_, err = client.Score(context.Background(), fixtureRequest)
+	check("a transport failure", err)
+
+	// A backoff that is abandoned before the next attempt.
+	unwell := newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		writeJSON(w, http.StatusInternalServerError, `{"error":{"message":"boom"}}`)
+	})
+	client, _ = newTestClient(t, unwell, nil)
+	client.sleep = func(context.Context, time.Duration) error { return context.DeadlineExceeded }
+	_, err = client.Score(context.Background(), fixtureRequest)
+	check("a retry abandoned mid-backoff", err)
+}
+
+// The prefix is checked at the source level too, because one path that builds
+// an error — a request that will not build — cannot be provoked from a test:
+// the URL it is handed has already been parsed. A stale prefix there would sit
+// unread until the day it was read, so the check is on the text rather than on
+// the path.
+func TestNoMessageCarriesAForeignPrefix(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+	prefixed := regexp.MustCompile(`^[a-z][a-z0-9_]*: `)
+
+	var scanned int
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		scanned++
+		ast.Inspect(file, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			text, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				return true
+			}
+			switch got := prefixed.FindString(text); got {
+			case "", "inference: ":
+			default:
+				t.Errorf("%s: the message %q is prefixed %q, not %q", name, text, got, "inference: ")
+			}
+			return true
+		})
+	}
+	// Without this, an empty directory or a changed file suffix would leave
+	// the loop with nothing to look at and the test green.
+	if scanned == 0 {
+		t.Fatal("scanned no source files: this check could not have failed")
+	}
+}
+
 func TestNewTreatsANegativeMaxRetriesAsNone(t *testing.T) {
-	client, err := New(Config{APIKey: testKey, MaxRetries: -1})
+	client, err := New(Config{APIKey: testKey, BaseURL: testBaseURL, MaxRetries: -1})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -453,7 +601,7 @@ func TestContextCancellationMidFlight(t *testing.T) {
 // the call would fail either way. What distinguishes them is the error. The
 // check returns ctx.Err() as it stands, the sentinel itself; the transport
 // returns a *url.Error wrapping it, which the client then wraps again in
-// "openai: chat completion". Both satisfy errors.Is, so this asserts on
+// "inference: chat completion". Both satisfy errors.Is, so this asserts on
 // identity instead.
 func TestAlreadyCancelledContextMakesNoCall(t *testing.T) {
 	api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
@@ -632,7 +780,7 @@ func TestUnsupportedShapeClassification(t *testing.T) {
 }
 
 func TestClientSatisfiesTheClassifierContract(t *testing.T) {
-	client, err := New(Config{APIKey: testKey})
+	client, err := New(Config{APIKey: testKey, BaseURL: testBaseURL})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

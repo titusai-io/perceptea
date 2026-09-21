@@ -32,11 +32,13 @@ type Evaluator interface {
 // it, so an evaluator cannot simply be built once at startup.
 type Settings struct {
 	// APIKey is the resolved provider key. It may be empty, in which case
-	// building the evaluator is expected to fail with openai.ErrNoAPIKey.
+	// building the evaluator is expected to fail with inference.ErrNoAPIKey.
 	APIKey string
 	// BaseURL is the resolved inference API root: the root of the service
 	// that runs the model, which the client turns into
-	// <BaseURL>/chat/completions.
+	// <BaseURL>/chat/completions. The configuration always resolves one, so
+	// this is never empty in practice; were it to be, building the evaluator
+	// would fail with inference.ErrNoBaseURL.
 	BaseURL string
 	// Model is the resolved model id.
 	Model string
@@ -52,7 +54,7 @@ type Options struct {
 	// Logger receives one line per request. Nil means slog.Default().
 	Logger *slog.Logger
 	// NewEvaluator builds the evaluator for one request. Nil means the real
-	// one: a provider/openai client behind classifier.New, sharing a single
+	// one: a provider/inference client behind classifier.New, sharing a single
 	// HTTP client across requests.
 	NewEvaluator func(Settings) (Evaluator, error)
 }

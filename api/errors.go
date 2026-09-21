@@ -14,7 +14,7 @@ import (
 
 	"github.com/titusai-io/perceptea/classifier"
 	"github.com/titusai-io/perceptea/internal/config"
-	"github.com/titusai-io/perceptea/provider/openai"
+	"github.com/titusai-io/perceptea/provider/inference"
 )
 
 // The machine-readable codes in an error body. They are part of the API: a
@@ -63,7 +63,7 @@ func (s *Server) classify(err error) failure {
 	// into the request deadline the provider reports both in one error, and
 	// the deadline is the less useful half: a 429 carrying a Retry-After is
 	// the one signal that tells a caller to back off rather than retry now.
-	var upstream *openai.APIError
+	var upstream *inference.APIError
 	if errors.As(err, &upstream) {
 		if upstream.StatusCode == http.StatusTooManyRequests {
 			return failure{
@@ -93,7 +93,7 @@ func (s *Server) classify(err error) failure {
 	case errors.Is(err, context.Canceled):
 		return failure{status: StatusClientClosedRequest}
 
-	case errors.Is(err, openai.ErrNoAPIKey):
+	case errors.Is(err, inference.ErrNoAPIKey):
 		return failure{
 			status:  http.StatusUnauthorized,
 			code:    codeMissingAPIKey,
@@ -189,7 +189,7 @@ func (s *Server) classifyRead(err error) failure {
 }
 
 // upstreamMessage renders a provider error without echoing its raw body.
-func upstreamMessage(e *openai.APIError) string {
+func upstreamMessage(e *inference.APIError) string {
 	msg := strings.TrimSpace(e.Message)
 	if msg == "" {
 		msg = strings.TrimSpace(e.Code)
