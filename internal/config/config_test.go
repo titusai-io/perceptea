@@ -44,6 +44,8 @@ func TestLoadFromDefaults(t *testing.T) {
 		AllowRequestCredentials: true,
 		LogLevel:                slog.LevelInfo,
 		LogFormat:               "text",
+		Scorer:                  "chat",
+		MaxBatchItems:           100,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("defaults:\n got %+v\nwant %+v", cfg, want)
@@ -58,6 +60,12 @@ func TestLoadFromDefaults(t *testing.T) {
 	}
 	if DefaultModel != "mistralai/Mistral-Small-24B-Instruct-2501" {
 		t.Errorf("DefaultModel = %q", DefaultModel)
+	}
+	if DefaultScorer != "chat" {
+		t.Errorf("DefaultScorer = %q, want the one that works against any endpoint", DefaultScorer)
+	}
+	if DefaultMaxBatchItems != 100 {
+		t.Errorf("DefaultMaxBatchItems = %d", DefaultMaxBatchItems)
 	}
 }
 
@@ -114,6 +122,8 @@ func TestLoadFromEveryVariable(t *testing.T) {
 		"PERCEPTEA_ALLOW_REQUEST_CREDENTIALS": "false",
 		"PERCEPTEA_LOG_LEVEL":                 "debug",
 		"PERCEPTEA_LOG_FORMAT":                "json",
+		"PERCEPTEA_SCORER":                    "logprob",
+		"PERCEPTEA_MAX_BATCH_ITEMS":           "250",
 	})
 
 	want := Config{
@@ -129,6 +139,8 @@ func TestLoadFromEveryVariable(t *testing.T) {
 		AllowRequestCredentials: false,
 		LogLevel:                slog.LevelDebug,
 		LogFormat:               "json",
+		Scorer:                  ScorerLogprob,
+		MaxBatchItems:           250,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("\n got %+v\nwant %+v", cfg, want)
@@ -246,6 +258,16 @@ func TestLoadFromErrors(t *testing.T) {
 			"PERCEPTEA_REASONING_EFFORT",
 			[]string{`"none"`},
 		},
+		// Same reasoning as the effort: neither scorer name is guessable,
+		// so a rejection has to say what the two are.
+		{
+			"bad scorer",
+			map[string]string{"PERCEPTEA_SCORER": "logits"},
+			"PERCEPTEA_SCORER",
+			[]string{`"logits"`, `"chat"`, `"logprob"`},
+		},
+		{"bad batch ceiling", map[string]string{"PERCEPTEA_MAX_BATCH_ITEMS": "many"}, "PERCEPTEA_MAX_BATCH_ITEMS", nil},
+		{"zero batch ceiling", map[string]string{"PERCEPTEA_MAX_BATCH_ITEMS": "0"}, "PERCEPTEA_MAX_BATCH_ITEMS", nil},
 	}
 
 	for _, tt := range tests {
@@ -309,5 +331,16 @@ func TestLogLevelAndFormatAreCaseInsensitive(t *testing.T) {
 	}
 	if cfg.LogFormat != "json" {
 		t.Errorf("LogFormat = %q, want %q", cfg.LogFormat, "json")
+	}
+}
+
+// The scorer name is matched case-insensitively and trimmed, the same way
+// every other closed-vocabulary setting is.
+func TestLoadFromScorerIsCaseInsensitive(t *testing.T) {
+	for _, in := range []string{"logprob", "LOGPROB", "  LogProb  "} {
+		cfg := loadWith(t, map[string]string{"PERCEPTEA_SCORER": in})
+		if cfg.Scorer != ScorerLogprob {
+			t.Errorf("PERCEPTEA_SCORER=%q gave Scorer=%q, want %q", in, cfg.Scorer, ScorerLogprob)
+		}
 	}
 }
