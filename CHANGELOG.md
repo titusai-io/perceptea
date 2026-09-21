@@ -11,6 +11,24 @@ always called out below.
 
 ### Added
 
+- **Every scoring call is shown its question's candidate list.** The call
+  judging one option used to be given no hint that the others existed, which
+  is most of what a "which of these?" question is. The whole list now renders
+  once per question — never once per candidate — into the shared half of the
+  prompt, between the worked examples and the state, so it is no extra call
+  and, on an endpoint that caches a matching prefix, no extra uncached token
+  after the first candidate. Measured on a held-out set of 764 questions:
+  accuracy 0.654 → 0.723 and Brier 0.486 → 0.420 on `Mistral-Small-24B`,
+  0.711 → 0.731 and 0.422 → 0.410 on `Llama-3.3-70B`, with the gain landing
+  on the multi-option questions and the binary ones unmoved; expected
+  calibration error improved on the first model and worsened on the second,
+  so the claim is accuracy and Brier and not calibration. A question with one
+  candidate — a noul, a one-option choice — has nothing to choose among,
+  renders no list, and produces the prompt it produced before, byte for byte.
+  `classifier.ScoreRequest` gains a `Candidates` field beside `Examples`,
+  carrying the list already rendered for the same reason `Examples` is, and
+  `classifier.CandidatesBlock` is what renders it. Both scorers place it, and
+  they share the code that does, so the two layouts cannot drift apart.
 - **`cmd/perceptea-bench`, a calibration benchmark.** Reads a labelled JSON
   Lines dataset and reports Brier score, expected calibration error over ten
   bins with the reliability table, accuracy, mean absolute error, and how many
@@ -65,15 +83,15 @@ always called out below.
   probes the running instance from inside it.
 - **The scoring prompt is laid out so its prefix can be cached.** A scoring
   call is sent as two messages: the estimator instruction, the question's
-  worked examples and the state in the first, and the one statement being
-  judged in the second. The first is byte-identical for every candidate of a
-  question — a choice of 4, a score of 4 and a noul are 9 calls and 3
-  prefixes — so an endpoint that caches a matching prompt prefix bills the
-  repeats at the cached rate. Nothing that varies by candidate may appear in
-  it, and a test asserts the bytes rather than the intent, because a stray
-  index or count would defeat the caching with no symptom except the bill. No
-  cache-control field is sent: the match is what does it, and a field an
-  endpoint has never heard of is one more thing for it to reject.
+  worked examples, its candidate list and the state in the first, and the one
+  statement being judged in the second. The first is byte-identical for every
+  candidate of a question — a choice of 4, a score of 4 and a noul are 9
+  calls and 3 prefixes — so an endpoint that caches a matching prompt prefix
+  bills the repeats at the cached rate. Nothing that varies by candidate may
+  appear in it, and a test asserts the bytes rather than the intent, because
+  a stray index or count would defeat the caching with no symptom except the
+  bill. No cache-control field is sent: the match is what does it, and a
+  field an endpoint has never heard of is one more thing for it to reject.
 - **`examples`: optional worked answers on any question.** Each is a state
   and the answer that was correct for it, written in the question type's own
   terms — an option key, a level index, or `true`/`false`. They render into

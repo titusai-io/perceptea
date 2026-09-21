@@ -33,9 +33,16 @@ reply     = {"p": 0.87}
 1. **One call per candidate.** A choice with 4 options is 4 calls; a score with
    4 levels is 4 calls; a noul is 1. Questions are evaluated in the same wave,
    bounded by `PERCEPTEA_MAX_CONCURRENCY`.
-2. **Independent probabilities.** Each `p` is estimated on its own, against the
-   same state, with no knowledge of its rivals — that is what makes them
-   comparable rather than a single sampled guess.
+2. **Independent probabilities, of a candidate that knows the field.** Each
+   `p` comes from its own call, against the same state, and nothing one call
+   returns can move another — that independence is what keeps a weak candidate
+   from dragging a strong one, and what makes the numbers comparable rather
+   than a single sampled guess. Each call is *shown* the question's other
+   candidates, because a call asked "is `d` correct?" with no idea that `a`,
+   `b` and `c` exist cannot compare, and comparing is most of what such a
+   question asks. Showing them is measured, not assumed — see
+   [The candidate list](#the-candidate-list) — and it is free: the list is the
+   same for every candidate of the question, so it rides in the cached prefix.
 3. **Logit, then softmax.** Each `p` is clamped into `(0.001, 0.999)`, mapped
    to `log(p / (1 - p))`, and the logits of one question's candidates are
    softmaxed into a distribution that sums to 1.
@@ -250,7 +257,8 @@ state is the same state nine times over. So the prompt is sent as two
 messages, cut exactly where the repetition stops:
 
 ```
-message 1  the estimator instruction, the question's examples, the STATE
+message 1  the estimator instruction, the question's examples, the question's
+           candidate list, the STATE
            ← identical for every candidate of the question, byte for byte
 message 2  the one STATEMENT being judged, and the question to answer
            ← a line or two, and the only part that changes
@@ -270,6 +278,50 @@ a wide choice, the prefix is nearly the whole bill.
 
 It is not free everywhere. An endpoint that does not cache simply sends the
 same tokens it always did, so the layout costs nothing where it gains nothing.
+
+### The candidate list
+
+Message 1 carries one more thing, for any question with more than one
+candidate: all of them.
+
+```
+The candidates for this question, exactly one of which is correct:
+- The correct which team should handle this is "billing" (Charges, refunds, invoices).
+- The correct which team should handle this is "technical" (Bugs).
+- The correct which team should handle this is "sales" (Pricing and plans).
+```
+
+Without it, the call judging `sales` has never been told that `billing` and
+`technical` were on the table. A question whose entire content is *which of
+these* is then being put to a model that cannot see *these*.
+
+It changes the numbers. Measured on a held-out set of 764 questions:
+
+| Model | accuracy | ECE | Brier |
+|---|---|---|---|
+| `Mistral-Small-24B`, without the list | 0.654 | 0.170 | 0.486 |
+| `Mistral-Small-24B`, with it | **0.723** | **0.146** | **0.420** |
+| `Llama-3.3-70B`, without the list | 0.711 | **0.149** | 0.422 |
+| `Llama-3.3-70B`, with it | **0.731** | 0.166 | **0.410** |
+
+Accuracy and Brier score improve on both models. Expected calibration error
+improves on one and worsens on the other by about as much, so the list earns
+credit for more answers being right and for better probabilities behind them
+— not for confidence that tracks the outcome more closely.
+
+The reason to believe it is where the movement lands, not how big it is. On
+the 70B model the two widest-option sources move (0.431 → 0.500 and 0.526 →
+0.574) and the binary and few-option sources do not move at all. An effect
+that appears exactly where comparison is the work, and nowhere it is not, is
+an effect; the same shift spread evenly over everything would have been a
+run.
+
+And it is free, which is the other half of why it is there. The list is the
+same bytes for every candidate of its question — that is what qualifies it
+for message 1 — so it is no extra call, and after the first candidate it is
+no extra uncached token either. A question with one candidate, a noul or a
+one-option choice, renders no list at all: there is nothing to choose among,
+and its prompt is byte for byte the prompt it was before.
 
 ### Reasoning models are the trap
 

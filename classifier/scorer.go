@@ -22,6 +22,27 @@ type ScoreRequest struct {
 	// backend keep that part of the prompt identical across a whole wave, and
 	// a backend needs to know nothing about question types to place a string.
 	Examples string
+	// Candidates is every candidate answer of the same question — this one
+	// included — already rendered as one labelled block by [CandidatesBlock],
+	// or empty when the question has only one candidate and there is nothing
+	// to choose among. A backend puts it in the part of the prompt that does
+	// not change between candidates, beside the examples.
+	//
+	// It crosses the seam rendered rather than as []string for the reason
+	// [Examples] does: every candidate of one question is handed the same
+	// bytes, which is what lets a backend keep that part of the prompt
+	// identical across a whole wave, and a backend needs to know nothing
+	// about question types to place a string.
+	//
+	// Each call is still scored on its own [Statement] alone — the list says
+	// what the question was choosing among, not which of them to prefer — so
+	// the probabilities stay independent. Telling the model that much was
+	// measured to make them better: on a held-out set of 764 questions it
+	// raised accuracy and lowered the Brier score on both models tried, and
+	// the gain landed on the questions with several options and nowhere else.
+	// The README has the numbers, including the one metric that did not
+	// improve on both.
+	Candidates string
 	// Temperature is the sampling temperature for the call.
 	Temperature float64
 }
