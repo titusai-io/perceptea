@@ -240,6 +240,84 @@ func TestQuestionRejectsBadInput(t *testing.T) {
 	}
 }
 
+// An example that gives no answer is not an example, and the three types have
+// to agree about that.
+//
+// JSON null unmarshals into an int and into a bool without complaint, leaving
+// the Go zero value behind: level 0 and false. Both are answers the question
+// could have given, so nothing downstream objects, and the model is taught
+// `the correct rating is level 0` for an example the request never answered —
+// on every candidate of the question, in the part of the prompt a provider
+// caches. A choice escapes this only by accident, because "" is not a declared
+// option key; the accident is not a policy, and a missing key is the same
+// omission as an explicit null.
+func TestAnExampleThatAnswersNothingIsRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name, src string
+	}{
+		{"a score answering null", `{"type":"score","criteria":["Low","High"],
+			"examples":[{"state":"no rush","answer":null}]}`},
+		{"a score with no answer key", `{"type":"score","criteria":["Low","High"],
+			"examples":[{"state":"no rush"}]}`},
+		{"a noul answering null", `{"type":"noul","instructions":"Angry?",
+			"examples":[{"state":"thanks!","answer":null}]}`},
+		{"a noul with no answer key", `{"type":"noul","instructions":"Angry?",
+			"examples":[{"state":"thanks!"}]}`},
+		{"a boolean answering null", `{"type":"boolean","instructions":"Angry?",
+			"examples":[{"state":"thanks!","answer":null}]}`},
+		{"a choice answering null", `{"type":"choice","criteria":{"billing":"money"},
+			"examples":[{"state":"charged twice","answer":null}]}`},
+		{"a choice with no answer key", `{"type":"choice","criteria":{"billing":"money"},
+			"examples":[{"state":"charged twice"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var q Question
+			err := json.Unmarshal([]byte(tc.src), &q)
+			if err == nil {
+				t.Fatalf("decoded an example with no answer without error, got %+v", q.Examples)
+			}
+			// The exact sentence, not merely the word: a decode that
+			// stumbled over the empty bytes produces a message mentioning
+			// "answers" too, and it describes the wrong fault.
+			if want := `example 0 is missing "answer"`; !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q, want it to say %q", err, want)
+			}
+		})
+	}
+
+	// The answers that are genuinely zero are answers, and still decode.
+	for _, tc := range []struct {
+		name, src string
+		check     func(*testing.T, Example)
+	}{
+		{"level zero", `{"type":"score","criteria":["Low","High"],
+			"examples":[{"state":"no rush","answer":0}]}`,
+			func(t *testing.T, ex Example) {
+				if ex.Level != 0 {
+					t.Errorf("Level = %d, want 0", ex.Level)
+				}
+			}},
+		{"false", `{"type":"noul","instructions":"Angry?",
+			"examples":[{"state":"thanks!","answer":false}]}`,
+			func(t *testing.T, ex Example) {
+				if ex.Noul {
+					t.Error("Noul = true, want false")
+				}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var q Question
+			if err := json.Unmarshal([]byte(tc.src), &q); err != nil {
+				t.Fatalf("a zero answer is an answer, but decoding failed: %v", err)
+			}
+			if len(q.Examples) != 1 {
+				t.Fatalf("got %d examples, want 1", len(q.Examples))
+			}
+			tc.check(t, q.Examples[0])
+		})
+	}
+}
+
 // TestQuestionRoundTripsTheDeclaredType checks a decoded question encodes back
 // to the document it arrived as, synonym included. Type normalises "boolean"
 // away because evaluation has only three answer shapes; the declared word is

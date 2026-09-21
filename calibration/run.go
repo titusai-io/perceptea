@@ -80,6 +80,20 @@ type Runner struct {
 	// Timeout bounds one attempt. Zero means the run's context is the only
 	// deadline.
 	Timeout time.Duration
+	// Scrub, when set, rewrites the text of every error this run records.
+	//
+	// A benchmark's failures are written into a document people store and
+	// diff, and a provider error quotes the URL it was calling. That URL is
+	// routinely a gateway with a credential in its userinfo or its query —
+	// net/http masks the password in a *url.Error and nothing else, so the
+	// username and the whole query string go through in full.
+	//
+	// The function is passed in rather than built here because which parts of
+	// a URL are secret is the server configuration's business, and this
+	// package measures a classifier: it has no opinion about environment
+	// variables and should not acquire one to redact a string. The command
+	// knows both and wires them together. Nil records the error as it came.
+	Scrub func(string) string
 }
 
 // attempt names one unit of work: which case, and which repeat of it.
@@ -180,7 +194,7 @@ func (r Runner) evaluate(ctx context.Context, c Case, number int) Outcome {
 
 	resp, err := r.Evaluator.Evaluate(ctx, c.Request(r.Model, r.Temperature))
 	if err != nil {
-		out.Err = err
+		out.Err = r.scrubbed(err)
 		return out
 	}
 	answer, ok := resp.Answers.Get(c.Name)
@@ -199,6 +213,37 @@ func (r Runner) evaluate(ctx context.Context, c Case, number int) Outcome {
 	out.Answer = answer
 	return out
 }
+
+// scrubbed applies [Runner.Scrub] to err's text.
+//
+// It is applied here, where the failure is recorded, rather than where the
+// report is rendered: an [Outcome] is exported and a caller may print one,
+// and a redaction that only the report performs is one an caller can walk
+// straight past. Nothing is copied when there was nothing to remove.
+func (r Runner) scrubbed(err error) error {
+	if err == nil || r.Scrub == nil {
+		return err
+	}
+	text := r.Scrub(err.Error())
+	if text == err.Error() {
+		return err
+	}
+	return scrubbedError{text: text, err: err}
+}
+
+// scrubbedError reports the redacted text and keeps the original underneath,
+// so that errors.Is and errors.As still reach whatever the provider returned.
+type scrubbedError struct {
+	text string
+	err  error
+}
+
+func (e scrubbedError) Error() string { return e.text }
+
+// Unwrap keeps the original error reachable for errors.Is and errors.As. The
+// redaction is for what gets *written* — a report, a log line — and an
+// in-process caller that deliberately unwraps is not that.
+func (e scrubbedError) Unwrap() error { return e.err }
 
 // Throttle bounds how many [classifier.Scorer] calls are in flight across
 // everything that shares the returned scorer. A limit of less than one

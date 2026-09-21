@@ -93,6 +93,23 @@ func NewServer(opts Options) (*Server, error) {
 	if cfg.MaxBatchItems < 1 {
 		cfg.MaxBatchItems = config.DefaultMaxBatchItems
 	}
+	// The scorer is not a limit and cannot be normalised the way the four
+	// above are: the two scorers are different estimators of the same
+	// quantity, so quietly reading an unrecognised word as one of them would
+	// answer every request with numbers from the estimator whoever wrote it
+	// had just decided not to use. Absent is not a choice and takes the
+	// default like everything else here; a word this server does not know
+	// stops it starting, as every other malformed setting does. Left to the
+	// provider factory it was a generic 500 on every request, with
+	// /api/health still reporting ok.
+	switch cfg.Scorer {
+	case "":
+		cfg.Scorer = config.DefaultScorer
+	case config.ScorerChat, config.ScorerLogprob:
+	default:
+		return nil, fmt.Errorf("%s: %q is not a scorer; expected %q or %q",
+			config.EnvScorer, cfg.Scorer, config.ScorerChat, config.ScorerLogprob)
+	}
 
 	logger := opts.Logger
 	if logger == nil {

@@ -45,7 +45,17 @@ type BatchResult struct {
 	// result can be placed even when no ID was given.
 	Index int `json:"index"`
 	// Answers is the evaluation, when it succeeded.
-	Answers Answers `json:"answers,omitempty"`
+	// Answers is always present, including on a failed item, where it is an
+	// empty object. The tag says nothing because omitempty cannot elide a
+	// struct and never could: Answers is an OrderedMap, so the tag it used
+	// to carry was a claim the encoder never honoured.
+	//
+	// Making absence meaningful — a *Answers that an unevaluated item simply
+	// omits — would read better than an empty object that looks like
+	// "evaluated, found nothing". It is a change to a shape the README
+	// documents, so it belongs in one deliberate change to this type and
+	// that document, not in a quiet divergence between them.
+	Answers Answers `json:"answers"`
 	// Usage is what this item cost.
 	Usage Usage `json:"usage"`
 	// Error says why this item has no answers. It is per-item on purpose:
@@ -125,8 +135,12 @@ func (w *batchWork) result() evaluation {
 // failed gets its [BatchResult.Error] set and the rest of the batch runs on.
 // An error is returned only for something that invalidates the whole request —
 // no items, no questions, a question set that does not validate, an unknown
-// mode, no [Scorer], or a cancelled context — because none of those could have
-// produced a useful result for any item.
+// mode, no [Scorer], a Scorer that cannot serve [ModeOneshot], or a
+// cancellation that stopped work still outstanding — because none of those
+// could have produced a useful result for any item.
+//
+// A cancellation that arrives once every call has come back is not one of
+// them: there is nothing left for it to stop, and the results are complete.
 //
 // Every candidate of every item is one wave. That is the difference from
 // calling [Evaluator.Evaluate] in a loop, where each call would fan out to the
@@ -158,6 +172,29 @@ func (e *Evaluator) EvaluateBatch(ctx context.Context, req BatchRequest) (BatchR
 	// states and charge the caller for the walk each time.
 	if err := Validate(req.Questions); err != nil {
 		return BatchResponse{}, err
+	}
+
+	// Also the batch's rather than the item's: whether the scorer can
+	// generate at all is a property of how this Evaluator was wired, and it
+	// will be the same answer for the hundredth item as for the first. Left
+	// to the wave it would be reported as a hundred identical per-item
+	// failures inside an otherwise successful batch.
+	if mode == ModeOneshot {
+		if _, ok := e.scorer.(Generator); !ok {
+			return BatchResponse{}, fmt.Errorf("%w (%T)", ErrOneshotUnsupported, e.scorer)
+		}
+	}
+
+	// The candidates depend on the question set alone, so they are built once
+	// for the whole batch. Rendering them per item would re-render every
+	// question's examples block up to a hundred times over, for bytes that
+	// are the same every time by construction.
+	var tasks []candidate
+	if mode == ModeParallel {
+		var err error
+		if tasks, err = parallelTasks(req.Questions); err != nil {
+			return BatchResponse{}, err
+		}
 	}
 
 	results := make([]BatchResult, len(req.Items))
@@ -200,16 +237,9 @@ func (e *Evaluator) EvaluateBatch(ctx context.Context, req BatchRequest) (BatchR
 				},
 			}}
 		} else {
-			tasks, slots, err := parallelTasks(req.Questions)
-			if err != nil {
-				// The question set is the batch's, not this item's, so a
-				// block that will not render fails every item alike. It is
-				// still recorded per item rather than failing the request:
-				// the caller reads the same reason on each, in the place
-				// they are already looking.
-				results[i].Error = err.Error()
-				continue
-			}
+			// The candidates are the batch's; only the slots their scores
+			// land in are this item's.
+			slots := resultSlots(req.Questions, tasks)
 			w.results = slots
 			w.group = &waveGroup{calls: e.scoreCalls(req.Model, req.Temperature, state, tasks, slots)}
 		}

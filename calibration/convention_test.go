@@ -18,6 +18,11 @@ import (
 // So the two are run over the same inputs and compared. Merging them would
 // force one context's error messages onto the other; this pins the only part
 // that has to agree.
+//
+// Two halves, because a decoder is half defined by what it refuses. Pinning
+// only the answers both accept let the two disagree about which documents
+// have an answer at all — see
+// TestTheAnswerConventionRefusesTheSameDocuments.
 func TestTheAnswerConventionMatchesTheClassifiers(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -62,5 +67,64 @@ func TestTheAnswerConventionMatchesTheClassifiers(t *testing.T) {
 				t.Errorf("noul: this package read %v, the classifier read %v", got.Noul, want.Noul)
 			}
 		})
+	}
+}
+
+// TestTheAnswerConventionRefusesTheSameDocuments is the other half: a label
+// that was never given must be refused, by both decoders, for every question
+// type.
+//
+// JSON null is the case that is easy to miss. json.Unmarshal reads it into an
+// int and into a bool without complaint and leaves the Go zero value, so a
+// score labelled null becomes level 0 and a noul becomes false — a label the
+// dataset never gave. A choice escapes only by accident, because "" is not a
+// declared option key, which is what makes the three types disagree about one
+// document.
+//
+// It matters more here than in a request. A worked example teaches the model
+// something wrong; a dataset label is the ground truth every number in the
+// report is scored against, so a fabricated one makes the Brier score, the
+// calibration error, the accuracy and the mean absolute error all wrong — a
+// silent wrong answer from the one tool whose job is saying whether the
+// answers can be trusted.
+func TestTheAnswerConventionRefusesTheSameDocuments(t *testing.T) {
+	questions := []struct{ name, question string }{
+		{"choice", `{"type":"choice","criteria":{"billing":"money","tech":"bugs"}}`},
+		{"score", `{"type":"score","criteria":["Low","High","Critical"]}`},
+		{"noul", `{"type":"noul","instructions":"Is it urgent?"}`},
+		{"the boolean synonym", `{"type":"boolean","instructions":"Is it urgent?"}`},
+	}
+	answers := []struct{ name, field string }{
+		{"an explicit null answer", `,"answer":null`},
+		{"no answer at all", ``},
+	}
+
+	for _, q := range questions {
+		for _, a := range answers {
+			t.Run(q.name+" with "+a.name, func(t *testing.T) {
+				// The classifier's decoder, reached the only way it is
+				// exposed: a question carrying one worked example.
+				doc := q.question[:len(q.question)-1] +
+					`,"examples":[{"state":"some state"` + a.field + `}]}`
+				var viaClassifier classifier.Question
+				if err := json.Unmarshal([]byte(doc), &viaClassifier); err == nil {
+					t.Errorf("the classifier accepted %s", doc)
+				}
+
+				// This package's decoder, over the same question and answer.
+				line := `{"id":"c1","state":"some state","question":` + q.question + a.field + "}\n"
+				_, err := ParseDataset(strings.NewReader(line))
+				if err == nil {
+					t.Fatalf("this package accepted %s", line)
+				}
+				// The dataset's own error still says where in the file to
+				// look, and which field is missing.
+				for _, want := range []string{"line 1", `"answer"`} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %q, want it to mention %q", err, want)
+					}
+				}
+			})
+		}
 	}
 }

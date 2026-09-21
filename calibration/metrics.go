@@ -36,30 +36,73 @@ type Calibration struct {
 	// ECE is the expected calibration error: the bin-count-weighted mean gap
 	// between MeanPredicted and ObservedFrequency. Zero is perfect; the worst
 	// attainable value is 1, which is what a run that predicted 1.0 for
-	// events that never happened would score.
+	// events that never happened would score. The bound holds for any input,
+	// a probability outside [0,1] included; see [sanitise].
 	ECE float64 `json:"ece"`
 	// Bins always has [BinCount] entries, empty ones included, so that two
 	// reports line up row for row when they are diffed.
 	Bins []Bin `json:"bins"`
 }
 
+// sanitise maps a number that is not a probability onto the nearest one that
+// is: anything below zero, and a NaN, to 0; anything above one to 1.
+//
+// A stray value is clamped rather than rejected because the classifier
+// already guarantees the range, and a benchmark that panicked on one would be
+// a worse instrument than one that recorded it at the edge. [Calibrate] is
+// exported, though, so "already guaranteed" is a statement about one caller
+// and not about every caller — and an unclamped value does not merely land in
+// the wrong bin, it is *averaged*: a prediction of 5 gave a bin whose mean
+// predicted probability was 5 and an expected calibration error of 3.5,
+// against a documented maximum of 1. A NaN was worse than wrong; it made the
+// whole report NaN, and a NaN cannot be written as JSON at all, so -json
+// failed with an encoding error instead of a number.
+//
+// The bin and the value are both taken from here so that the two cannot
+// disagree about what a stray value meant.
+func sanitise(p float64) float64 {
+	if math.IsNaN(p) || p < 0 {
+		return 0
+	}
+	if p > 1 {
+		return 1
+	}
+	return p
+}
+
+// binLow reports the lower bound of bin i. It is the one place a bin boundary
+// is computed, so that the table's rows and [binIndex]'s arithmetic cannot
+// describe different bins.
+func binLow(i int) float64 { return float64(i) / BinCount }
+
 // binIndex reports which bin p belongs to.
 //
 // The bins are half-open so that a probability on a boundary belongs to the
 // bin it opens — 0.1 is the first member of [0.1,0.2), not the last of
 // [0.0,0.1) — and the top bin is closed at 1.0 so that a certain prediction
-// has somewhere to go instead of indexing off the end. A probability outside
-// [0,1] is clamped rather than rejected: the classifier already guarantees
-// the range, and a benchmark that panicked on a stray value would be a worse
-// instrument than one that recorded it in the nearest bin.
+// has somewhere to go instead of indexing off the end.
+//
+// p*BinCount and [binLow] are two different roundings of the same boundary
+// and they do not always agree: for exactly one float64 in [0,1] — the one
+// just below 0.9 — the multiplication rounds up to 9.0 and puts the value in
+// a bin whose reported Low is above it. It changes no arithmetic, because
+// the bin's mean is computed from its members either way, but it makes one
+// row of a table people read to check a claim say something untrue about its
+// own contents. So the index is walked back to the bin that actually
+// contains p.
 func binIndex(p float64) int {
-	if math.IsNaN(p) || p <= 0 {
-		return 0
-	}
+	p = sanitise(p)
 	if p >= 1 {
 		return BinCount - 1
 	}
-	return int(p * BinCount)
+	i := int(p * BinCount)
+	if i >= BinCount {
+		i = BinCount - 1
+	}
+	if i > 0 && p < binLow(i) {
+		i--
+	}
+	return i
 }
 
 // Calibrate groups preds into [BinCount] equal-width bins and computes the
@@ -74,14 +117,16 @@ func Calibrate(preds []Prediction) Calibration {
 	sums := make([]float64, BinCount)
 	held := make([]int, BinCount)
 	for i := range bins {
-		bins[i].Low = float64(i) / BinCount
-		bins[i].High = float64(i+1) / BinCount
+		bins[i].Low = binLow(i)
+		bins[i].High = binLow(i + 1)
 	}
 
 	for _, pred := range preds {
 		i := binIndex(pred.P)
 		bins[i].Count++
-		sums[i] += pred.P
+		// The sanitised value, not the one that arrived: a bin must not
+		// report a mean its own bounds exclude. See [sanitise].
+		sums[i] += sanitise(pred.P)
 		if pred.Holds {
 			held[i]++
 		}

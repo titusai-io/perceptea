@@ -117,6 +117,77 @@ func TestSummariseCoverage(t *testing.T) {
 	}
 }
 
+// TestSummariseCoverageUnderRepeats is the fixture mixedRun cannot be.
+//
+// Every case there runs once and every attempt is dispatched, so Cases,
+// Repeat and Attempted all read as "the same eight things counted three
+// ways" and Failure.Attempt is 1 for every failure. Four of the numbers
+// Summarise reports are therefore indistinguishable from constants: the
+// repeat could be hard-coded to 1, the attempts could be counted as the
+// cases, the cases as the attempts, and a failure could claim to be attempt 1
+// whichever pass it came from, and the suite would not notice.
+//
+// So: three cases, four repeats, and one case cut short — a run that was
+// interrupted, which is a shape the command now reports rather than throws
+// away. Twelve attempts were possible and ten happened, nine of them
+// answered, and the one that failed was the third pass over the case on line
+// two. No two of those numbers are equal, and none of them equals 1.
+func TestSummariseCoverageUnderRepeats(t *testing.T) {
+	cases := noulDataset(t, "clouds", "sun", "fog")
+	answer := classifier.Answer{Type: classifier.TypeNoul, Noul: 0.6}
+
+	var outcomes []Outcome
+	add := func(index, attempt int, err error) {
+		o := Outcome{Case: cases[index], Attempt: attempt, Answer: answer}
+		if err != nil {
+			o.Answer = classifier.Answer{}
+			o.Err = err
+		}
+		outcomes = append(outcomes, o)
+	}
+	for attempt := 1; attempt <= 4; attempt++ {
+		add(0, attempt, nil)
+	}
+	for attempt := 1; attempt <= 4; attempt++ {
+		var err error
+		if attempt == 3 {
+			err = errors.New("upstream said no")
+		}
+		add(1, attempt, err)
+	}
+	// The third case was interrupted after two of its four passes.
+	add(2, 1, nil)
+	add(2, 2, nil)
+
+	got := Summarise(Run{Cases: len(cases), Repeat: 4, Outcomes: outcomes}).Coverage
+
+	want := Coverage{Cases: 3, Repeat: 4, Attempted: 10, Evaluated: 9, Failed: 1}
+	if got.Cases != want.Cases || got.Repeat != want.Repeat || got.Attempted != want.Attempted ||
+		got.Evaluated != want.Evaluated || got.Failed != want.Failed {
+		t.Errorf("coverage = %+v, want %+v", got, want)
+	}
+	if len(got.Failures) != 1 {
+		t.Fatalf("got %d failures, want 1", len(got.Failures))
+	}
+	// Which pass a failure came from is the whole reason a run is repeated:
+	// a case that fails on one pass of four is a different finding from one
+	// that fails on all of them.
+	if f := got.Failures[0]; f.ID != "sun" || f.Line != 2 || f.Attempt != 3 {
+		t.Errorf("failure = %+v, want sun on line 2, attempt 3", f)
+	}
+}
+
+// The repeat a report carries is the one the run declared, and a run that
+// declared none ran each case once.
+func TestSummariseReportsOneRepeatForARunThatDeclaredNone(t *testing.T) {
+	for _, declared := range []int{0, -1, 1} {
+		got := Summarise(Run{Cases: 1, Repeat: declared}).Coverage.Repeat
+		if got != 1 {
+			t.Errorf("a run with Repeat %d reported %d, want 1", declared, got)
+		}
+	}
+}
+
 // TestSummariseCalibration works the whole reliability table out by hand from
 // the seventeen probabilities the fixture's seven answered cases produce.
 //

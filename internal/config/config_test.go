@@ -336,11 +336,28 @@ func TestLogLevelAndFormatAreCaseInsensitive(t *testing.T) {
 
 // The scorer name is matched case-insensitively and trimmed, the same way
 // every other closed-vocabulary setting is.
+//
+// "chat" is here although it is also the default, and that is the point: with
+// only the logprob spellings listed, the branch that accepts "chat" could be
+// deleted, or made to select the other scorer, and every test still passed —
+// the explicit value and the default coincide, so nothing could tell an
+// operator who asked for the default from one whose request was ignored.
 func TestLoadFromScorerIsCaseInsensitive(t *testing.T) {
-	for _, in := range []string{"logprob", "LOGPROB", "  LogProb  "} {
-		cfg := loadWith(t, map[string]string{"PERCEPTEA_SCORER": in})
-		if cfg.Scorer != ScorerLogprob {
-			t.Errorf("PERCEPTEA_SCORER=%q gave Scorer=%q, want %q", in, cfg.Scorer, ScorerLogprob)
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"logprob", ScorerLogprob},
+		{"LOGPROB", ScorerLogprob},
+		{"  LogProb  ", ScorerLogprob},
+		{"chat", ScorerChat},
+		{"CHAT", ScorerChat},
+		{"  Chat  ", ScorerChat},
+	}
+	for _, tt := range tests {
+		cfg := loadWith(t, map[string]string{"PERCEPTEA_SCORER": tt.in})
+		if cfg.Scorer != tt.want {
+			t.Errorf("PERCEPTEA_SCORER=%q gave Scorer=%q, want %q", tt.in, cfg.Scorer, tt.want)
 		}
 	}
 }

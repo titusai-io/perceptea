@@ -17,7 +17,11 @@ always called out below.
   cases actually ran. It exists because everything else here is a claim about
   accuracy: without it, "this model is better calibrated" or "the new prompt
   is no worse" cannot be checked. `-json` output carries no timestamp and is
-  rounded, so two runs diff cleanly.
+  rounded, so two runs diff cleanly. Interrupting a run prints the report for
+  the attempts that finished and exits non-zero saying how many there were,
+  rather than discarding minutes of paid-for calls; a credential carried in
+  `PERCEPTEA_INFERENCE_BASE_URL` is struck out of every failure the report
+  records, because that document is one you are told to store and diff.
 - **`PERCEPTEA_SCORER=chat|logprob`.** The default `chat` asks the model to
   write a probability. `logprob` asks a one-word Yes or No and computes the
   answer from the first token's distribution, which is continuous where a
@@ -96,7 +100,14 @@ always called out below.
   table. Results come back in request order with their `index` and the
   caller's own `id`, and `meta` counts the items, the successes and the
   failures so the two cases can be told apart without walking the results.
-  Per-item errors are scrubbed of credentials like every other message.
+  A per-item failure goes through the same classification a whole-request one
+  does: the `error` is the message `/api/evaluate` would have sent for the
+  same fault, scrubbed of credentials, and `error_code` beside it carries the
+  code from the error table — `upstream_rate_limited`, `upstream_error`,
+  `timeout`, `invalid_request`, `unsupported_mode` — so an item can be
+  branched on the way a request can. A failure the server cannot vouch for is
+  reported as the opaque upstream error rather than quoted, because its text
+  names the endpoint this server calls.
 - **`PERCEPTEA_MAX_BATCH_ITEMS`** (default `100`) bounds one batch. A batch
   fans out into items × candidates calls, so the ceiling is what stops a
   single request committing to an unbounded amount of provider spend; over it

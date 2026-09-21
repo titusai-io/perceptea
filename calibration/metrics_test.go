@@ -1,6 +1,7 @@
 package calibration
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 )
@@ -47,6 +48,87 @@ func TestBinIndexPutsBoundariesInTheBinTheyOpen(t *testing.T) {
 		if got := binIndex(c.p); got != c.want {
 			t.Errorf("binIndex(%v) = %d, want %d", c.p, got, c.want)
 		}
+	}
+}
+
+// TestEveryProbabilityLandsInABinThatContainsIt walks both float64 neighbours
+// of every boundary, which is where the two ways of computing a boundary —
+// p*BinCount, and the float64(i)/BinCount the table prints — can disagree.
+//
+// They disagree for exactly one value: the float64 just below 0.9, which
+// p*BinCount rounds up into bin 9, whose printed Low is above it. It costs no
+// arithmetic, because a bin's mean is computed from its members either way.
+// It does put a number in a row that says it cannot be there, in the one
+// table this tool exists to have somebody read.
+func TestEveryProbabilityLandsInABinThatContainsIt(t *testing.T) {
+	var probabilities []float64
+	for i := 0; i <= BinCount; i++ {
+		b := binLow(i)
+		probabilities = append(probabilities, math.Nextafter(b, 0), b, math.Nextafter(b, 1))
+	}
+	probabilities = append(probabilities, 0, 1, 0.5, 0.05, 1.0/3.0)
+
+	for _, p := range probabilities {
+		if p < 0 || p > 1 {
+			continue
+		}
+		i := binIndex(p)
+		if i < 0 || i >= BinCount {
+			t.Fatalf("binIndex(%.20g) = %d, outside the table", p, i)
+		}
+		if p < binLow(i) {
+			t.Errorf("binIndex(%.20g) = %d, whose Low is %.20g: the row excludes its own member",
+				p, i, binLow(i))
+		}
+		// The last bin is closed at 1.0; every other is half-open.
+		if i < BinCount-1 && p >= binLow(i+1) {
+			t.Errorf("binIndex(%.20g) = %d, whose High is %.20g: the row excludes its own member",
+				p, i, binLow(i+1))
+		}
+	}
+}
+
+// TestCalibrateKeepsECEWithinItsDocumentedRange: Calibrate is exported, so
+// "the classifier guarantees [0,1]" is a statement about one caller. An
+// unclamped value is averaged into its bin, and a prediction of 5 gave an
+// expected calibration error of 3.5 against a documented maximum of 1.
+func TestCalibrateKeepsECEWithinItsDocumentedRange(t *testing.T) {
+	got := Calibrate([]Prediction{{P: -3, Holds: false}, {P: 5, Holds: false}})
+
+	if got.ECE < 0 || got.ECE > 1 {
+		t.Errorf("ECE = %v, want it within [0,1]: the range is documented", got.ECE)
+	}
+	// -3 is recorded at 0 and 5 at 1, so the bins hold means their own
+	// bounds allow.
+	for i, bin := range got.Bins {
+		if bin.Count == 0 {
+			continue
+		}
+		if bin.MeanPredicted < bin.Low || bin.MeanPredicted > bin.High {
+			t.Errorf("bin %d [%v,%v] reports a mean of %v", i, bin.Low, bin.High, bin.MeanPredicted)
+		}
+	}
+	// Both are confidently wrong once clamped, so the worst score is exactly
+	// what a run that predicted 1.0 for something that never happened gets:
+	// bin 0 claims 0 and observes 0, bin 9 claims 1 and observes 0.
+	closeTo(t, "ECE", got.ECE, 0.5)
+}
+
+// TestCalibrateSurvivesANaNProbability: a NaN made ECE NaN, and a NaN cannot
+// be written as JSON — so -json, the form the README tells people to store
+// and diff, failed with an encoding error instead of printing a report.
+func TestCalibrateSurvivesANaNProbability(t *testing.T) {
+	got := Calibrate([]Prediction{{P: math.NaN(), Holds: false}, {P: 0.8, Holds: true}})
+
+	if math.IsNaN(got.ECE) {
+		t.Fatalf("ECE = NaN")
+	}
+	if _, err := json.Marshal(got); err != nil {
+		t.Errorf("the calibration cannot be written as JSON: %v", err)
+	}
+	// The NaN is recorded as 0, which is where binIndex already put it.
+	if got.Bins[0].Count != 1 || got.Bins[0].MeanPredicted != 0 {
+		t.Errorf("bin 0 = %+v, want one prediction recorded at 0", got.Bins[0])
 	}
 }
 

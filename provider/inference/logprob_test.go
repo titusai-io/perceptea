@@ -363,6 +363,26 @@ func TestLogprobRecoversTheProbabilityFromTheBranches(t *testing.T) {
 			[]logprobToken{{" No", lnPoint8}, {"Unlikely", lnPoint1}},
 			0.2,
 		},
+		// The two single-branch answers exponentiate a number the provider
+		// chose, so they are the two places a reported logprob can push the
+		// result out of [0,1] — a log probability above zero is a
+		// probability above one, which is not a thing, and a provider that
+		// rounds or mangles one can send it. Both are clamped rather than
+		// passed on; the renormalised both-branches answer cannot leave the
+		// range at all and is not clamped.
+		{
+			// exp(0.5) = 1.6487, clamped to 1 rather than reported as a
+			// probability of 165%.
+			"a yes branch above one is clamped",
+			[]logprobToken{{" Yes", 0.5}, {"Probably", lnPoint05}},
+			1,
+		},
+		{
+			// 1 − exp(0.5) = −0.6487, clamped to 0.
+			"a no branch above one is clamped",
+			[]logprobToken{{" No", 0.5}, {"Unlikely", lnPoint1}},
+			0,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := alwaysJSON(t, logprobFixture{
@@ -390,29 +410,64 @@ func TestLogprobRecoversTheProbabilityFromTheBranches(t *testing.T) {
 // neutral 0.5 would turn the model's most certain answers into its least
 // informative ones — silently, and in the direction that looks like a result.
 // The difference of the two logprobs is small even when the logprobs are not.
+//
+// Three separate pieces of arithmetic keep that true, and a fixture reaches
+// only the ones its own shape reaches. One spelling per branch never gets
+// past logSumExp's single-value shortcut, so it says nothing at all about the
+// factoring inside; and a difference of 200 is large but still an ordinary
+// float64 exponent, so it says nothing about what happens past 709, where
+// exp overflows. Each case below names the one it is for.
 func TestLogprobDoesNotUnderflowOnAConfidentAnswer(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
-		yes, no           float64
+		top               []logprobToken
 		lower, upper      float64
 		wantNearCertainty string
 	}{
 		{
 			// l_yes − l_no = 200, so P = 1/(1 + e^−200) and e^−200 ≈ 1.4e−87:
 			// P is 1 to every digit float64 has.
-			"certain the statement is true", -800, -1000, 1 - 1e-12, 1,
+			"certain the statement is true",
+			[]logprobToken{{" Yes", -800}, {" No", -1000}},
+			1 - 1e-12, 1,
 			"a certain yes",
 		},
 		{
 			// The mirror image: P = e^−200/(1 + e^−200) ≈ 1.4e−87. Small, and
 			// not zero — the arithmetic has room for it.
-			"certain the statement is false", -1000, -800, 1e-90, 1e-80,
+			"certain the statement is false",
+			[]logprobToken{{" Yes", -1000}, {" No", -800}},
+			1e-90, 1e-80,
 			"a certain no",
+		},
+		{
+			// Two spellings of the confident branch, which is the only way
+			// into logSumExp's summing path: with one value per branch it
+			// takes the single-value shortcut and the factoring above it is
+			// never executed. Summed naively, exp(−800) and exp(−805) are
+			// both zero, log(0) is −Inf, and the certain yes comes back as
+			// 0 — a certain no. Factoring the largest out first gives
+			// −800 + log(1 + e^−5) = −799.993, and the answer is 1.
+			"certain, and spelled two ways",
+			[]logprobToken{{" Yes", -800}, {"Yes", -805}, {" No", -1000}},
+			1 - 1e-12, 1,
+			"a certain yes",
+		},
+		{
+			// Past 709 the difference itself is too big to exponentiate:
+			// e^900 is +Inf, and +Inf/(1 + +Inf) is NaN. The branch that
+			// exponentiates the negated difference when the difference is
+			// positive is what keeps the argument non-positive either way,
+			// and nothing below 709 can tell it is there.
+			"certain by more than a float64 can exponentiate",
+			[]logprobToken{{" Yes", -0.001}, {" No", -900}},
+			1 - 1e-12, 1,
+			"an overwhelmingly certain yes",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := alwaysJSON(t, logprobFixture{
-				chosen: " Yes", top: []logprobToken{{" Yes", tc.yes}, {" No", tc.no}},
+				chosen: " Yes", top: tc.top,
 			}.body())
 			client, _ := newLogprobClient(t, api, nil)
 
@@ -432,6 +487,54 @@ func TestLogprobDoesNotUnderflowOnAConfidentAnswer(t *testing.T) {
 					got.Probability, tc.lower, tc.upper, tc.wantNearCertainty)
 			}
 		})
+	}
+}
+
+// The non-finite guard is tested by calling branchProbability directly,
+// because nothing can reach it through a reply: JSON has no literal for a NaN
+// or an infinity, and an overflowing number is a decode error that fails the
+// call long before this. A fixture claiming to cover it would be covering the
+// decoder instead.
+//
+// What the guard is worth is visible here: without it the poisoned spelling
+// makes its whole branch NaN, and the answer with it — a model that said no
+// with probability 0.2 comes back as 0.5, or as a NaN the caller downgrades
+// to the same thing.
+func TestANonFiniteLogprobIsDroppedRatherThanSummed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		poisonY float64
+	}{
+		{"a NaN", math.NaN()},
+		{"a positive infinity", math.Inf(1)},
+		{"a negative infinity", math.Inf(-1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One unusable yes and one sound no: dropping the yes leaves the
+			// no branch alone, which scores 1 − 0.2 = 0.8.
+			got, ok := branchProbability([]topLogprob{
+				{Token: " Yes", Logprob: tc.poisonY},
+				{Token: " No", Logprob: lnPoint2},
+			})
+			if !ok {
+				t.Fatal("branchProbability found no branch at all; the sound one is still there")
+			}
+			if math.IsNaN(got) {
+				t.Fatalf("probability is NaN: the unusable value was summed instead of dropped")
+			}
+			if !closeTo(got, 0.8) {
+				t.Errorf("probability = %v, want 0.8: the sound branch alone", got)
+			}
+		})
+	}
+
+	// And a distribution made only of unusable numbers has no branch in it,
+	// which is the error case and not a neutral score.
+	if got, ok := branchProbability([]topLogprob{
+		{Token: " Yes", Logprob: math.NaN()},
+		{Token: " No", Logprob: math.Inf(-1)},
+	}); ok {
+		t.Errorf("branchProbability returned %v and claimed a branch, want no branch at all", got)
 	}
 }
 
@@ -583,6 +686,33 @@ func TestLogprobRejectsADistributionWithNoAnswerInIt(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the error does not mention %q: %s", want, msg)
 		}
+	}
+}
+
+// The offered tokens go into an error message, so they go through the same
+// scrubber every other provider string does.
+//
+// A token from a real tokenizer could not be a whole API key. But the field
+// is a string the provider fills in and this package does not get to decide
+// what it holds — a gateway that echoes a key into its output should not be
+// helped to put it somewhere else, and the cost of assuming otherwise is a
+// credential in a 502 body.
+func TestTheTokensAnErrorQuotesAreRedacted(t *testing.T) {
+	api := alwaysJSON(t, logprobFixture{
+		chosen: "Based", chosenLogprob: lnPoint5,
+		top: []logprobToken{{"Based", lnPoint5}, {testKey, lnPoint3}},
+	}.body())
+	client, _ := newLogprobClient(t, api, nil)
+
+	_, err := client.Score(context.Background(), fixtureRequest)
+	if err == nil {
+		t.Fatal("Score returned no error; neither token offered is an answer")
+	}
+	if strings.Contains(err.Error(), testKey) {
+		t.Errorf("the API key reached the error message: %s", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Errorf("nothing was redacted, so the scrubber never ran: %s", err)
 	}
 }
 

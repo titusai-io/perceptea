@@ -8,6 +8,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -737,6 +738,87 @@ func TestEvaluateHonoursContextCancellation(t *testing.T) {
 			t.Fatalf("Evaluate returned %v, want context.Canceled", err)
 		}
 	})
+}
+
+// A scorer error that names the fault is the point of the diagnosable
+// sentinels — the one the provider package raises when it gets no logprobs,
+// the one this package raises for a truncated one-shot reply — and the API
+// layer turns both into a 502 whose message says which setting to change.
+//
+// The candidate that fails fails fast; its siblings take a moment to unwind an
+// in-flight round trip or a retry backoff, and the caller's deadline can land
+// in that window. The diagnosis is what the caller needs, and a deadline that
+// arrived after the wave had already been abandoned for a better reason must
+// not replace it — a 502 naming the setting would become a bare 504.
+func TestEvaluateReportsTheScorerErrorAndNotTheDeadlineItRanInto(t *testing.T) {
+	const total = 4
+	refused := errors.New("the provider returned no token logprobs")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	var arrived atomic.Int64
+	inFlight := make(chan struct{}, total)
+
+	scorer := ScorerFunc(func(callCtx context.Context, _ ScoreRequest) (ScoreResult, error) {
+		if arrived.Add(1) == 1 {
+			// Fail only once every sibling is inside the scorer, so none of
+			// them can be turned away at the gate and every one of them is
+			// still unwinding when the caller's deadline lands.
+			for range total - 1 {
+				<-inFlight
+			}
+			return ScoreResult{}, refused
+		}
+		// A call that does not abandon itself the instant the wave is
+		// cancelled. The deadline is what ends it.
+		inFlight <- struct{}{}
+		<-ctx.Done()
+		return ScoreResult{}, callCtx.Err()
+	})
+
+	_, err := New(scorer, WithMaxConcurrency(total)).Evaluate(ctx, Request{
+		State:     StringState("s"),
+		Questions: noulQuestions(total),
+	})
+	if !errors.Is(err, refused) {
+		t.Fatalf("Evaluate returned %v, want the scorer's own error: the deadline landed while the wave unwound and must not stand in for the diagnosis", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Evaluate returned %v, which a caller classifies as a timeout rather than as the upstream fault it was", err)
+	}
+}
+
+// An evaluation whose every call came back has an answer, and it was paid for.
+// A cancellation that lands after the last one has nothing left to stop, and
+// throwing the answers away for it discards finished work.
+func TestEvaluateKeepsAnAnswerFinishedBeforeTheCancellation(t *testing.T) {
+	const total = 4
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var done atomic.Int64
+	scorer := ScorerFunc(func(context.Context, ScoreRequest) (ScoreResult, error) {
+		// The last call hangs the caller up before returning its own result,
+		// so the context is certainly expired by the time the wave is
+		// collected, and every call has certainly succeeded.
+		if done.Add(1) == total {
+			cancel()
+		}
+		return ScoreResult{Probability: 0.5}, nil
+	})
+
+	resp, err := New(scorer, WithMaxConcurrency(total)).Evaluate(ctx, Request{
+		State:     StringState("s"),
+		Questions: noulQuestions(total),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned %v; every call had come back before the cancellation", err)
+	}
+	if got := resp.Answers.Len(); got != total {
+		t.Fatalf("got %d answers, want %d", got, total)
+	}
 }
 
 func TestEvaluateRejectsBadRequests(t *testing.T) {

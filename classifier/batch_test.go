@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -571,19 +572,73 @@ func TestEvaluateBatchCountsAFailedItemsUsage(t *testing.T) {
 	}
 }
 
+// parallel_calls is what reached the provider, not what was planned, and the
+// two are equal in every batch where nothing fails — which is every other
+// batch in this file, so none of them can tell the two apart.
+//
+// Here they cannot be equal. One item fails on its first call and abandons the
+// rest of its own, so the count is short of the plan by however many were
+// abandoned; a concurrency of one makes that exactly five, because no two
+// calls of the failing item can be in flight at once and every one after the
+// first meets a group that has already been cancelled.
+func TestEvaluateBatchParallelCallsCountsWhatWasIssued(t *testing.T) {
+	const (
+		items   = 2
+		perItem = 6
+		planned = items * perItem
+		// One call of the failing item, and all of the other item's.
+		wantIssued = 1 + perItem
+	)
+
+	var issued atomic.Int64
+	scorer := ScorerFunc(func(_ context.Context, req ScoreRequest) (ScoreResult, error) {
+		issued.Add(1)
+		if req.State == "state 0" {
+			return ScoreResult{}, errors.New("provider refused the request")
+		}
+		return ScoreResult{Probability: 0.5}, nil
+	})
+
+	resp, err := New(scorer, WithMaxConcurrency(1)).EvaluateBatch(context.Background(), BatchRequest{
+		Items:     batchOf(items),
+		Questions: noulQuestions(perItem),
+	})
+	if err != nil {
+		t.Fatalf("EvaluateBatch returned %v", err)
+	}
+	if got := issued.Load(); got != wantIssued {
+		t.Fatalf("the scorer was entered %d times, want %d: the fixture no longer abandons what it means to", got, wantIssued)
+	}
+	if resp.Meta.ParallelCalls != wantIssued {
+		t.Errorf("Meta.ParallelCalls = %d, want %d — the calls that reached the provider, not the %d that were planned",
+			resp.Meta.ParallelCalls, wantIssued, planned)
+	}
+}
+
 // ----------------------------------------------------------------- stress --
 
 // TestEvaluateBatchStressUnderRace hammers the hand-off between the wave's
-// goroutines and the accounting that reads what they wrote.
+// goroutines and the accounting that reads what they wrote, over many rounds
+// of a many-item batch whose calls finish in an unpredictable order.
 //
-// A race there is load-dependent by nature. With one item, or with calls that
-// all take the same time, the last write finishes long before the collector
-// runs and -race never sees the two overlap; a suite that exercises the path
-// once can stay green for months over a genuine one. So this runs many rounds
-// of a many-item batch whose calls finish in an unpredictable order, with some
-// items failing and some succeeding, and reads every field the collector
-// reads — the group's error, the per-item results slots, a one-shot item's
-// outcome, and the token counters.
+// What it can fail on, and what it cannot, are worth stating, because a
+// stress fixture is the easiest kind of test to believe too much of.
+//
+// It can fail on an accounting mistake that only some interleavings produce:
+// a result placed against the wrong item, an item's slots read as another's,
+// a usage total that misses a late write, meta counts that disagree with the
+// results they claim to summarise. Those are what the per-item token counts
+// below are for — each item's calls report a count of its own, so a collector
+// that reads the wrong item's slots is a wrong number rather than the same
+// number twice. It can also fail, under -race, on a genuine data race
+// introduced by an edit that reads a group's results before the whole wave
+// has finished.
+//
+// It cannot fail on removing [batchWork]'s mutex. The wave's WaitGroup
+// already orders every write before the collector's read, so the lock is not
+// what makes the read safe today and -race sees nothing when it goes; the
+// lock is there for the edit that stops waiting for the whole wave, and only
+// that edit would show it up. The source comment on the field says the same.
 //
 // It is worth running as `go test ./classifier/ -race -run Stress -count=20`
 // and with -cpu varied; the plain suite runs one pass of it.
@@ -596,10 +651,22 @@ func TestEvaluateBatchStressUnderRace(t *testing.T) {
 	)
 	refused := errors.New("provider refused the request")
 
-	// failing is every third item, so each round mixes items that complete
-	// with items abandoned part way through.
+	// The items whose state ends in 3 or 7 fail — two of the twelve — so each
+	// round mixes items that complete with items abandoned part way through.
 	failing := func(state string) bool {
 		return strings.HasSuffix(state, "3") || strings.HasSuffix(state, "7")
+	}
+
+	// Each item's calls report a token count of its own, so that the numbers
+	// a round checks can tell one item's results from another's. Uniform
+	// counts would make a collector that read the wrong item's slots look
+	// exactly like one that read the right ones.
+	tokensFor := func(state string) int {
+		n, err := strconv.Atoi(strings.TrimPrefix(state, "state "))
+		if err != nil {
+			t.Errorf("unexpected state %q", state)
+		}
+		return n + 1
 	}
 
 	var counter atomic.Int64
@@ -612,7 +679,7 @@ func TestEvaluateBatchStressUnderRace(t *testing.T) {
 		if failing(req.State) {
 			return ScoreResult{}, refused
 		}
-		return ScoreResult{Probability: 0.5, InputTokens: 2, OutputTokens: 1}, nil
+		return ScoreResult{Probability: 0.5, InputTokens: tokensFor(req.State), OutputTokens: 1}, nil
 	})
 
 	e := New(scorer, WithMaxConcurrency(limit))
@@ -645,10 +712,12 @@ func TestEvaluateBatchStressUnderRace(t *testing.T) {
 			if got := r.Answers.Len(); got != perItem {
 				t.Fatalf("round %d: item %d has %d answers, want %d", round, i, got, perItem)
 			}
-			// Every candidate of a completed item reported its tokens, so the
-			// arithmetic is exact: a torn or missing write shows up here.
-			if r.Usage.InputTokens == nil || *r.Usage.InputTokens != 2*perItem {
-				t.Fatalf("round %d: item %d input tokens = %v, want %d", round, i, r.Usage.InputTokens, 2*perItem)
+			// Every candidate of a completed item reported its tokens, and
+			// they are this item's own, so the arithmetic is exact: a torn
+			// write, a missing one, or another item's slots all show up here.
+			want := (i + 1) * perItem
+			if r.Usage.InputTokens == nil || *r.Usage.InputTokens != want {
+				t.Fatalf("round %d: item %d input tokens = %v, want %d", round, i, r.Usage.InputTokens, want)
 			}
 			in += *r.Usage.InputTokens
 			out += *r.Usage.OutputTokens
@@ -886,6 +955,85 @@ func TestEvaluateBatchHonoursContextCancellation(t *testing.T) {
 	})
 }
 
+// The other half of that rule: a cancellation stops a batch only while there
+// is something left for it to stop. One that lands after the last call has
+// come back discards finished, paid-for work, and one that lands after an item
+// has already failed for a reason of its own hides that reason behind a
+// timeout.
+func TestEvaluateBatchKeepsWhatWasFinishedBeforeTheCancellation(t *testing.T) {
+	t.Run("every item finished", func(t *testing.T) {
+		const items, perItem = 3, 2
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var done atomic.Int64
+		scorer := ScorerFunc(func(context.Context, ScoreRequest) (ScoreResult, error) {
+			if done.Add(1) == items*perItem {
+				cancel()
+			}
+			return ScoreResult{Probability: 0.5, InputTokens: 2, OutputTokens: 1}, nil
+		})
+
+		resp, err := New(scorer, WithMaxConcurrency(items*perItem)).EvaluateBatch(ctx, BatchRequest{
+			Items:     batchOf(items),
+			Questions: noulQuestions(perItem),
+		})
+		if err != nil {
+			t.Fatalf("EvaluateBatch returned %v; every item had come back before the cancellation", err)
+		}
+		if resp.Meta == nil || resp.Meta.Succeeded != items || resp.Meta.Failed != 0 {
+			t.Fatalf("meta = %+v, want %d succeeded and none failed", resp.Meta, items)
+		}
+		if resp.Usage.InputTokens == nil || *resp.Usage.InputTokens != 2*items*perItem {
+			t.Fatalf("batch input tokens = %v, want %d: a cancelled batch threw away what the items cost",
+				resp.Usage.InputTokens, 2*items*perItem)
+		}
+	})
+
+	t.Run("an item's own failure is still its own", func(t *testing.T) {
+		const items = 3
+		refused := errors.New("provider refused the request")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// The first item fails on its only call, and the others wait for that
+		// to have happened before finishing: the failure is on the group
+		// before anything cancels, so what follows cannot be blamed on it.
+		failed := make(chan struct{})
+		var once sync.Once
+		var done atomic.Int64
+
+		scorer := ScorerFunc(func(_ context.Context, req ScoreRequest) (ScoreResult, error) {
+			if req.State == "state 0" {
+				once.Do(func() { close(failed) })
+				return ScoreResult{}, refused
+			}
+			<-failed
+			if done.Add(1) == items-1 {
+				cancel()
+			}
+			return ScoreResult{Probability: 0.5}, nil
+		})
+
+		resp, err := New(scorer, WithMaxConcurrency(items)).EvaluateBatch(ctx, BatchRequest{
+			Items:     batchOf(items),
+			Questions: noulQuestions(1),
+		})
+		if err != nil {
+			t.Fatalf("EvaluateBatch returned %v; the items that succeeded and the one that failed were all settled before the cancellation", err)
+		}
+		if got := resultFor(t, resp, "t-0"); !strings.Contains(got.Error, refused.Error()) {
+			t.Fatalf("the failed item reports %q, want the provider's own refusal", got.Error)
+		}
+		if resp.Meta.Succeeded != items-1 || resp.Meta.Failed != 1 {
+			t.Fatalf("meta says %d/%d, want %d succeeded and 1 failed",
+				resp.Meta.Succeeded, resp.Meta.Failed, items-1)
+		}
+	})
+}
+
 // ---------------------------------------------------------------- oneshot --
 
 // A one-shot batch is one generation per item, taking a slot of the same
@@ -929,8 +1077,15 @@ func TestEvaluateBatchOneshot(t *testing.T) {
 
 // A provider that cannot generate fails every item of a one-shot batch, one
 // error at a time, rather than the request.
+// Whether the scorer can generate is a property of the Evaluator, not of any
+// item, and it will be the same answer for the hundredth state as for the
+// first. So it fails the request, like the other whole-request faults, rather
+// than arriving as a 200 in which every single item failed for the same
+// reason — and no call is made in the meantime.
 func TestEvaluateBatchOneshotUnsupported(t *testing.T) {
+	var calls atomic.Int64
 	ok := ScorerFunc(func(context.Context, ScoreRequest) (ScoreResult, error) {
+		calls.Add(1)
 		return ScoreResult{Probability: 0.5}, nil
 	})
 	resp, err := New(ok).EvaluateBatch(context.Background(), BatchRequest{
@@ -938,16 +1093,14 @@ func TestEvaluateBatchOneshotUnsupported(t *testing.T) {
 		Questions: noulQuestions(1),
 		Mode:      ModeOneshot,
 	})
-	if err != nil {
-		t.Fatalf("EvaluateBatch returned %v", err)
+	if !errors.Is(err, ErrOneshotUnsupported) {
+		t.Fatalf("EvaluateBatch returned %v, want ErrOneshotUnsupported", err)
 	}
-	for _, r := range resp.Results {
-		if !strings.Contains(r.Error, "oneshot") {
-			t.Errorf("item %d error = %q, want the unsupported-mode failure", r.Index, r.Error)
-		}
+	if len(resp.Results) != 0 || resp.Meta != nil {
+		t.Errorf("a request no item could have served returned a populated response: %+v", resp)
 	}
-	if resp.Meta.Failed != 2 {
-		t.Errorf("Meta.Failed = %d, want 2", resp.Meta.Failed)
+	if n := calls.Load(); n != 0 {
+		t.Errorf("the scorer was called %d times for a mode it cannot serve", n)
 	}
 }
 

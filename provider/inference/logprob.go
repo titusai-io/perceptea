@@ -266,9 +266,13 @@ func firstTokenDistribution(resp *chatResponse) ([]topLogprob, bool) {
 func branchProbability(top []topLogprob) (float64, bool) {
 	var yes, no []float64
 	for _, t := range top {
-		// A logprob that is not a finite number is not a measurement. It
-		// cannot arrive through JSON, and dropping it here is what keeps a
-		// NaN from reaching the arithmetic and coming out as a 0.5.
+		// A logprob that is not a finite number is not a measurement, and
+		// one that is not finite poisons everything it is summed with: a
+		// single NaN makes its whole branch NaN, and the answer with it.
+		// It cannot arrive through JSON — the decoder has no literal for a
+		// NaN or an infinity and rejects an overflowing number outright — so
+		// no reply fixture can reach this line, and the guard is tested by
+		// calling this function with one directly.
 		v, ok := finite(t.Logprob)
 		if !ok {
 			continue
@@ -283,7 +287,12 @@ func branchProbability(top []topLogprob) (float64, bool) {
 
 	switch {
 	case len(yes) > 0 && len(no) > 0:
-		return clamp01(logistic(logSumExp(yes) - logSumExp(no))), true
+		// No clamp: logistic of a finite number is in [0,1] by construction,
+		// and finite is what the guard above leaves in the slices. The two
+		// cases below are not the same — each exponentiates a logprob the
+		// provider reported, and a provider that reports one above zero
+		// claims a probability above one.
+		return logistic(logSumExp(yes) - logSumExp(no)), true
 	case len(yes) > 0:
 		return clamp01(math.Exp(logSumExp(yes))), true
 	case len(no) > 0:

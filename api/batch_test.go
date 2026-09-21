@@ -3,15 +3,18 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/titusai-io/perceptea/classifier"
 	"github.com/titusai-io/perceptea/internal/config"
@@ -64,6 +67,15 @@ func noulAnswers(name string, p float64) classifier.Answers {
 	return *answers
 }
 
+// upstreamItemError is a per-item error as the classifier actually reports
+// one: the rendered text of whatever the scorer returned, here a provider
+// that answered with a status. Building it from the real type rather than
+// writing the rendered form out keeps this fixture honest — a per-item error
+// the classifier could never produce proves nothing about what a caller sees.
+func upstreamItemError(status int, message string) string {
+	return (&inference.APIError{StatusCode: status, Message: message}).Error()
+}
+
 // sampleBatchResponse is one answered item and one that failed, which is the
 // shape the endpoint exists to be able to return.
 func sampleBatchResponse() classifier.BatchResponse {
@@ -79,7 +91,7 @@ func sampleBatchResponse() classifier.BatchResponse {
 			{
 				ID:    "t-2",
 				Index: 1,
-				Error: "upstream provider error (status 502): no message",
+				Error: upstreamItemError(http.StatusBadGateway, ""),
 			},
 		},
 		Usage: classifier.Usage{InputTokens: ptr(120), OutputTokens: ptr(6)},
@@ -111,7 +123,7 @@ func TestBatchHappyPath(t *testing.T) {
 		`{"id":"t-1","index":0,"answers":{"angry":{"type":"noul","noul":0.88}},` +
 		`"usage":{"input_tokens":120,"output_tokens":6}},` +
 		`{"id":"t-2","index":1,"answers":{},"usage":{"input_tokens":null,"output_tokens":null},` +
-		`"error":"upstream provider error (status 502): no message"}],` +
+		`"error":"upstream provider error (status 502): no message","error_code":"upstream_error"}],` +
 		`"usage":{"input_tokens":120,"output_tokens":6},` +
 		`"meta":{"mode":"parallel","latency_ms":640,"parallel_calls":2,"items":2,"succeeded":1,"failed":1}}`
 	if got := strings.TrimSpace(w.Body.String()); got != want {
@@ -418,8 +430,8 @@ func TestBatchWhereEveryItemFailedIsStill200(t *testing.T) {
 	h.answerBatch(classifier.BatchResponse{
 		Model: "probe-1",
 		Results: []classifier.BatchResult{
-			{ID: "t-1", Index: 0, Error: "upstream provider error (status 502): no message"},
-			{ID: "t-2", Index: 1, Error: "upstream provider error (status 502): no message"},
+			{ID: "t-1", Index: 0, Error: upstreamItemError(http.StatusBadGateway, "")},
+			{ID: "t-2", Index: 1, Error: upstreamItemError(http.StatusBadGateway, "")},
 		},
 		Meta: &classifier.BatchMeta{Mode: classifier.ModeParallel, Items: 2, Failed: 2},
 	})
@@ -517,9 +529,9 @@ func TestBatchWholeRequestFailuresUseTheErrorTable(t *testing.T) {
 	}
 }
 
-// A per-item error is a message on its way to a caller like any other: an
-// upstream failure can quote the endpoint it was talking to, and that URL can
-// carry a credential.
+// A per-item error is a message on its way to a caller like any other: a
+// provider that echoes the key it rejected puts the credential in its own
+// message, which the item then carries.
 func TestBatchScrubsPerItemErrors(t *testing.T) {
 	const callerKey = "sk-caller-9876543210"
 	h := newHarness(t, nil)
@@ -527,8 +539,8 @@ func TestBatchScrubsPerItemErrors(t *testing.T) {
 	h.evaluateBatch = func(_ context.Context, req classifier.BatchRequest) (classifier.BatchResponse, error) {
 		return classifier.BatchResponse{
 			Results: []classifier.BatchResult{
-				{ID: "t-1", Index: 0, Error: "calling https://gw.example/v1 with " + testKey},
-				{ID: "t-2", Index: 1, Error: "calling https://gw.example/v1 with " + callerKey},
+				{ID: "t-1", Index: 0, Error: upstreamItemError(401, "rejected key "+testKey)},
+				{ID: "t-2", Index: 1, Error: upstreamItemError(401, "rejected key "+callerKey)},
 			},
 			Meta: &classifier.BatchMeta{Items: 2, Failed: 2},
 		}, nil
@@ -548,8 +560,278 @@ func TestBatchScrubsPerItemErrors(t *testing.T) {
 			t.Errorf("a per-item error carried the credential %q to the caller:\n%s", secret, out)
 		}
 	}
-	if !strings.Contains(out, "[redacted]") {
-		t.Errorf("nothing was redacted, so the scrubber never ran:\n%s", out)
+	if strings.Count(out, "[redacted]") != 2 {
+		t.Errorf("want both credentials redacted, so the scrubber ran on every item:\n%s", out)
+	}
+}
+
+// The bug this endpoint had: a per-item error went through the scrubber and
+// nothing else, so a hop that never reached the provider told the caller the
+// name of the host it failed to reach. On /api/evaluate the same failure is
+// an opaque 502, and the caller of a batch had not named the endpoint either
+// — PERCEPTEA_ALLOW_REQUEST_CREDENTIALS is off here, so they could not have.
+func TestBatchDoesNotDiscloseTheEndpointInAPerItemError(t *testing.T) {
+	const host = "llm-gateway.internal.corp"
+	transport := &url.Error{
+		Op:  "Post",
+		URL: "http://" + host + ":8443/v1/chat/completions",
+		Err: errors.New("dial tcp: lookup " + host + ": no such host"),
+	}
+	h := newHarness(t, func(cfg *config.Config) {
+		cfg.BaseURL = "http://" + host + ":8443/v1"
+		cfg.AllowRequestCredentials = false
+	})
+	h.mu.Lock()
+	h.evaluateBatch = func(context.Context, classifier.BatchRequest) (classifier.BatchResponse, error) {
+		return classifier.BatchResponse{
+			Results: []classifier.BatchResult{
+				{ID: "t-1", Index: 0, Error: fmt.Errorf("inference: chat completion: %w", transport).Error()},
+			},
+			Meta: &classifier.BatchMeta{Items: 1, Failed: 1},
+		}, nil
+	}
+	h.mu.Unlock()
+
+	w := h.postBatch(`{"items":[{"id":"t-1","state":"s"}],"questions":{"q":{"type":"noul"}}}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	out := w.Body.String()
+	if strings.Contains(out, host) {
+		t.Errorf("the response named the upstream host:\n%s", out)
+	}
+	// The single endpoint's own words for the same failure, so the two
+	// endpoints cannot drift apart without this saying so.
+	want := (&Server{}).classify(transport).message
+	item := decodeBatchItems(t, w)[0]
+	if item.Error != want {
+		t.Errorf("item error = %q, want %q", item.Error, want)
+	}
+	if item.ErrorCode != codeUpstreamError {
+		t.Errorf("error_code = %q, want %q", item.ErrorCode, codeUpstreamError)
+	}
+	// The detail is the whole point of keeping it: an operator has to be able
+	// to find out what the caller was not told.
+	line := findLog(t, h.logs, "request")
+	if detail, _ := line["error"].(string); !strings.Contains(detail, host) {
+		t.Errorf("the log line does not carry the transport detail: %v", line)
+	}
+}
+
+// decodeBatchItems reads the results out of a batch response, with the code
+// each failure carries.
+func decodeBatchItems(t *testing.T, w *httptest.ResponseRecorder) []batchItemResult {
+	t.Helper()
+	var body batchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding %q: %v", w.Body.String(), err)
+	}
+	if len(body.Results) == 0 {
+		t.Fatalf("the batch carried no results: %s", w.Body.String())
+	}
+	return body.Results
+}
+
+// TestClassifyItemReadsAnUpstreamStatus pins the one piece of this package
+// that reads a format it does not own: the status inside a rendered
+// *inference.APIError. The input is built from the real type, so a change to
+// how it renders fails here rather than quietly demoting every provider
+// status to "could not be reached".
+func TestClassifyItemReadsAnUpstreamStatus(t *testing.T) {
+	s := &Server{}
+	tests := []struct {
+		name     string
+		err      *inference.APIError
+		wantCode string
+		wantMsg  string
+	}{
+		{
+			name:     "a rate limit is its own code",
+			err:      &inference.APIError{StatusCode: 429, Message: "rate limit exceeded"},
+			wantCode: codeUpstreamRateLimited,
+			wantMsg:  "upstream provider error (status 429): rate limit exceeded",
+		},
+		{
+			name:     "any other status is an upstream error",
+			err:      &inference.APIError{StatusCode: 503, Message: "overloaded"},
+			wantCode: codeUpstreamError,
+			wantMsg:  "upstream provider error (status 503): overloaded",
+		},
+		{
+			name:     "a provider that said nothing",
+			err:      &inference.APIError{StatusCode: 500},
+			wantCode: codeUpstreamError,
+			wantMsg:  "upstream provider error (status 500): no message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := s.classifyItem(tt.err.Error())
+			if got.code != tt.wantCode || got.message != tt.wantMsg {
+				t.Errorf("classifyItem(%q) = %q / %q, want %q / %q",
+					tt.err.Error(), got.code, got.message, tt.wantCode, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestClassifyItemMatchesTheRequestTable walks the faults both endpoints can
+// see and checks that an item is told what a request would be told. The
+// message is taken from Server.classify rather than written out, so the two
+// cannot drift.
+func TestClassifyItemMatchesTheRequestTable(t *testing.T) {
+	s := &Server{cfg: config.Config{RequestTimeout: 30 * time.Second}}
+	tests := []struct {
+		name     string
+		err      error
+		wantCode string
+	}{
+		{"a truncated scoring reply", fmt.Errorf("%w: cut off", inference.ErrTruncatedReply), codeUpstreamError},
+		{"an endpoint with no logprobs", fmt.Errorf("%w: none came back", inference.ErrNoLogprobs), codeUpstreamError},
+		{"a model that answered neither word", fmt.Errorf("%w: it said maybe", inference.ErrNoDecisionToken), codeUpstreamError},
+		{"a truncated one-shot reply", fmt.Errorf("%w; raise the limit", classifier.ErrTruncatedReply), codeUpstreamError},
+		{"a provider that cannot do one-shot", fmt.Errorf("%w (fake)", classifier.ErrOneshotUnsupported), codeUnsupportedMode},
+		{"a deadline that expired", fmt.Errorf("inference: chat completion: %w", context.DeadlineExceeded), codeTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := s.classifyItem(tt.err.Error())
+			want := s.classify(tt.err)
+			if got.code != tt.wantCode {
+				t.Errorf("code = %q, want %q", got.code, tt.wantCode)
+			}
+			if got.message != want.message {
+				t.Errorf("item message = %q, request message = %q: the two endpoints disagree",
+					got.message, want.message)
+			}
+			// The package tag is the server's own bookkeeping and has no
+			// business on the wire.
+			if strings.HasPrefix(got.message, "inference: ") || strings.HasPrefix(got.message, "classifier: ") {
+				t.Errorf("message = %q, want the package tag stripped", got.message)
+			}
+		})
+	}
+}
+
+// Anything the table does not recognise is the opaque upstream failure, not
+// the caller's own error text. This is the property the allow-list exists
+// for: a message nobody vetted never reaches a caller.
+func TestClassifyItemIsAnAllowList(t *testing.T) {
+	s := &Server{}
+	for _, text := range []string{
+		`inference: chat completion: Post "http://gw.internal/v1": connection refused`,
+		"inference: retry abandoned: giving up (last attempt: dial tcp 10.0.0.4:8443: refused)",
+		`classifier: one-shot model returned non-JSON: I'm sorry, I can't`,
+		"something nobody has written yet",
+	} {
+		got := s.classifyItem(text)
+		if got.message != unreachableMessage {
+			t.Errorf("classifyItem(%q) told the caller %q, want the opaque message", text, got.message)
+		}
+		if got.code != codeUpstreamError {
+			t.Errorf("classifyItem(%q) code = %q, want %q", text, got.code, codeUpstreamError)
+		}
+		if got.detail != text {
+			t.Errorf("classifyItem(%q) kept detail %q, want the whole text for the log", text, got.detail)
+		}
+	}
+}
+
+// An item the classifier rejected before it made a call is the caller's own
+// mistake and is reported as one. The real classifier produces the text, so a
+// change to its wording turns this red rather than turning a useful message
+// into "the upstream provider could not be reached".
+func TestBatchClassifiesAnItemTheClassifierRejects(t *testing.T) {
+	h := newHarness(t, nil)
+	h.mu.Lock()
+	h.evaluateBatch = func(ctx context.Context, req classifier.BatchRequest) (classifier.BatchResponse, error) {
+		// The real thing, over a scorer that is never reached: only the item
+		// with no state is in the batch.
+		return classifier.New(classifier.ScorerFunc(
+			func(context.Context, classifier.ScoreRequest) (classifier.ScoreResult, error) {
+				t.Error("the scorer was called for an item with no state")
+				return classifier.ScoreResult{}, nil
+			})).EvaluateBatch(ctx, req)
+	}
+	h.mu.Unlock()
+
+	w := h.postBatch(`{"items":[{"id":"t-1"}],"questions":{"q":{"type":"noul","instructions":"It holds."}}}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	item := decodeBatchItems(t, w)[0]
+	if item.ErrorCode != codeInvalidRequest {
+		t.Errorf("error_code = %q, want %q for an item the caller sent wrong", item.ErrorCode, codeInvalidRequest)
+	}
+	if !strings.Contains(item.Error, `"state"`) {
+		t.Errorf("item error = %q, want it to name the field that is missing", item.Error)
+	}
+	if strings.HasPrefix(item.Error, "classifier: ") {
+		t.Errorf("item error = %q, want the package tag stripped", item.Error)
+	}
+}
+
+// A rate limit is the one upstream answer a caller is meant to act on, so it
+// has to be tellable from every other failure without reading prose.
+func TestBatchReportsARateLimitedItemWithItsOwnCode(t *testing.T) {
+	h := newHarness(t, nil)
+	h.answerBatch(classifier.BatchResponse{
+		Results: []classifier.BatchResult{
+			{ID: "t-1", Index: 0, Error: upstreamItemError(http.StatusTooManyRequests, "rate limit exceeded")},
+			{ID: "t-2", Index: 1, Error: upstreamItemError(http.StatusBadGateway, "upstream is unwell")},
+		},
+		Meta: &classifier.BatchMeta{Items: 2, Failed: 2},
+	})
+
+	items := decodeBatchItems(t, h.postBatch(sampleBatchBody))
+
+	if items[0].ErrorCode != codeUpstreamRateLimited {
+		t.Errorf("rate-limited item code = %q, want %q", items[0].ErrorCode, codeUpstreamRateLimited)
+	}
+	if items[1].ErrorCode != codeUpstreamError {
+		t.Errorf("failed item code = %q, want %q", items[1].ErrorCode, codeUpstreamError)
+	}
+}
+
+// A successful item carries no code at all, so "error_code" being present is
+// itself the signal.
+func TestBatchLeavesASucceededItemWithoutACode(t *testing.T) {
+	h := newHarness(t, nil)
+	h.answerBatch(sampleBatchResponse())
+
+	items := decodeBatchItems(t, h.postBatch(sampleBatchBody))
+
+	if items[0].ErrorCode != "" {
+		t.Errorf("a succeeded item carries error_code %q", items[0].ErrorCode)
+	}
+	if items[1].ErrorCode == "" {
+		t.Error("a failed item carries no error_code")
+	}
+}
+
+// itemDetails is what an operator reads when a batch went wrong wholesale.
+func TestItemDetailsDedupesAndCaps(t *testing.T) {
+	same := make([]string, 20)
+	for i := range same {
+		same[i] = "dial tcp: refused"
+	}
+	if got := itemDetails(same); got != "dial tcp: refused" {
+		t.Errorf("itemDetails(20 identical) = %q, want one copy", got)
+	}
+
+	distinct := make([]string, maxLoggedItemDetails+3)
+	for i := range distinct {
+		distinct[i] = fmt.Sprintf("failure %d", i)
+	}
+	got := itemDetails(distinct)
+	if strings.Count(got, "failure ") != maxLoggedItemDetails {
+		t.Errorf("itemDetails printed %d details, want %d: %q",
+			strings.Count(got, "failure "), maxLoggedItemDetails, got)
+	}
+	if !strings.Contains(got, "(+3 more)") {
+		t.Errorf("itemDetails = %q, want the rest counted", got)
 	}
 }
 

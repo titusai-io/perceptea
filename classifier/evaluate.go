@@ -2,6 +2,7 @@ package classifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -70,7 +71,11 @@ func New(s Scorer, opts ...Option) *Evaluator {
 // scored independently and concurrently — one wave, bounded by the configured
 // concurrency — and the independent probabilities are then normalised per
 // question. The first scorer error cancels the rest of the wave and is
-// returned; so is a cancelled ctx.
+// returned, in preference to a ctx that expired while the rest of the wave was
+// unwinding: the scorer's own error is the one that says what went wrong. A
+// ctx cancelled while calls are still outstanding is returned as itself, and
+// one cancelled after the last call came back is not returned at all — the
+// answers are complete and there is nothing left for it to stop.
 //
 // In [ModeOneshot] the whole request goes to the model as one prompt, which
 // needs a Scorer that also implements [Generator].
@@ -163,13 +168,18 @@ type candidate struct {
 }
 
 // parallelTasks lists every candidate of every question, in declaration
-// order, alongside the slots their scores go in: one slice of results per
-// question, one slot per candidate.
-func parallelTasks(qs Questions) ([]candidate, [][]ScoreResult, error) {
-	names := qs.Keys()
-	results := make([][]ScoreResult, len(names))
+// order, tagged with the slot its score goes in.
+//
+// The list depends on the questions alone and not on the state they are asked
+// about, so a batch builds it once and reuses it for every item; see
+// [resultSlots] for the part that is the item's own.
+//
+// The error is defensive. [Validate] renders every example's state before any
+// of this runs and rejects a question whose examples cannot be shown, so a
+// caller that validated — and both entry points do — cannot reach it.
+func parallelTasks(qs Questions) ([]candidate, error) {
 	var tasks []candidate
-	for qi, name := range names {
+	for qi, name := range qs.Keys() {
 		q, _ := qs.Get(name)
 		// Rendered once per question, not once per candidate: the block is
 		// the same for all of them, and rendering it per candidate would
@@ -177,15 +187,31 @@ func parallelTasks(qs Questions) ([]candidate, [][]ScoreResult, error) {
 		// whole value is being identical.
 		examples, err := ExamplesBlock(q)
 		if err != nil {
-			return nil, nil, fmt.Errorf("question %q: rendering examples: %w", name, err)
+			return nil, fmt.Errorf("classifier: question %q: rendering examples: %w", name, err)
 		}
-		stmts := statements(name, q)
-		results[qi] = make([]ScoreResult, len(stmts))
-		for ci, statement := range stmts {
+		for ci, statement := range statements(name, q) {
 			tasks = append(tasks, candidate{question: qi, index: ci, statement: statement, examples: examples})
 		}
 	}
-	return tasks, results, nil
+	return tasks, nil
+}
+
+// resultSlots allocates one slice of results per question and one slot per
+// candidate, which is what the tasks' question and index fields address.
+//
+// This is the part of a wave that belongs to one state rather than to the
+// question set: every item of a batch scores the same candidates and needs
+// its own slots to put the scores in.
+func resultSlots(qs Questions, tasks []candidate) [][]ScoreResult {
+	counts := make([]int, qs.Len())
+	for _, t := range tasks {
+		counts[t.question]++
+	}
+	results := make([][]ScoreResult, len(counts))
+	for qi, n := range counts {
+		results[qi] = make([]ScoreResult, n)
+	}
+	return results
 }
 
 // tokensOf sums what every completed call reported. A wave that failed part
@@ -216,10 +242,11 @@ func parallelEvaluation(qs Questions, results [][]ScoreResult, calls int) evalua
 // evaluateParallel scores every candidate of every question in one wave and
 // normalises each question's results into an answer.
 func (e *Evaluator) evaluateParallel(ctx context.Context, req Request, state string) (evaluation, error) {
-	tasks, results, err := parallelTasks(req.Questions)
+	tasks, err := parallelTasks(req.Questions)
 	if err != nil {
 		return evaluation{}, err
 	}
+	results := resultSlots(req.Questions, tasks)
 	group := &waveGroup{calls: e.scoreCalls(req.Model, req.Temperature, state, tasks, results)}
 
 	if err := e.runWave(ctx, []*waveGroup{group}); err != nil {
@@ -310,8 +337,10 @@ func (g *waveGroup) failure() error {
 // a hundred independent fan-outs competing for the same provider.
 //
 // A call's own failure is recorded on its group and cancels the rest of that
-// group. Only a cancellation from outside is returned as the wave's error, and
-// then only after every goroutine has finished.
+// group; its caller reads it from the group, where a batch can report it
+// against the one item it belongs to. The wave's own error is reserved for a
+// cancellation from outside that actually stopped work, and is returned only
+// after every goroutine has finished; see [stoppedByContext].
 func (e *Evaluator) runWave(ctx context.Context, groups []*waveGroup) error {
 	total := 0
 	for _, g := range groups {
@@ -378,11 +407,37 @@ func (e *Evaluator) runWave(ctx context.Context, groups []*waveGroup) error {
 	wg.Wait()
 
 	// Read after every goroutine has stopped, so a cancelled wave reports the
-	// cancellation rather than whichever group noticed it first.
-	if ctx.Err() != nil {
+	// cancellation rather than whichever group noticed it first — and only
+	// when the cancellation is what stopped something.
+	if ctx.Err() != nil && stoppedByContext(groups) {
 		return context.Cause(ctx)
 	}
 	return nil
+}
+
+// stoppedByContext reports whether the wave's context is what abandoned any of
+// these groups, which is the only thing that makes it the wave's failure
+// rather than an item's.
+//
+// Every call either filled its slot or recorded a failure on its group, so the
+// groups are the whole record of what happened and the context adds nothing to
+// it. A group that recorded no failure produced every answer it was asked for,
+// even if the caller's deadline landed a moment later; a group that recorded a
+// failure of its own has a reason worth reporting, and one that names a
+// setting to change is worth far more to whoever reads it than the deadline
+// that expired while its siblings were unwinding. Returning the context's
+// cause regardless would discard both.
+func stoppedByContext(groups []*waveGroup) bool {
+	for _, g := range groups {
+		err := g.failure()
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return true
+		}
+	}
+	return false
 }
 
 // answerFor normalises one question's independent scores into its answer.

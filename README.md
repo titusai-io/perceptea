@@ -444,8 +444,11 @@ reply this short.
 every endpoint does, some cap `top_logprobs` below the 20 asked for, and a
 gateway may strip the fields. Check yours before flipping the switch.
 
-**How it fails: loudly.** No logprobs is a 502 naming the setting and the
-model. It does not fall back to the chat scorer and it does not score a
+**How it fails: loudly.** No logprobs is a `502 upstream_error` on
+`/api/evaluate`, naming the setting and the model — and on
+`/api/evaluate/batch` it is the same message on the failed item, with
+`error_code` `upstream_error`, because a batch is served whatever became of
+its items. It does not fall back to the chat scorer and it does not score a
 neutral 0.5 — for the same reason a truncated reply does not. A model that
 answers a Yes-or-No question with neither word fails the same way, and the
 error prints the tokens it offered instead. Both faults repeat on every
@@ -618,11 +621,12 @@ curl -s localhost:5301/api/evaluate/batch \
       "index": 2,
       "answers": {},
       "usage": {"input_tokens": 552, "output_tokens": 16},
-      "error": "upstream provider error (status 429): rate limit exceeded"
+      "error": "upstream provider error (status 429): rate limit exceeded",
+      "error_code": "upstream_rate_limited"
     }
   ],
   "usage": {"input_tokens": 2836, "output_tokens": 80},
-  "meta": {"mode": "parallel", "latency_ms": 2140, "parallel_calls": 10,
+  "meta": {"mode": "parallel", "latency_ms": 2140, "parallel_calls": 12,
            "items": 3, "succeeded": 2, "failed": 1}
 }
 ```
@@ -641,9 +645,23 @@ state the provider refused gets its own `error` and the rest keep their
 answers — the opposite of a single evaluation, where the first error cancels
 the whole wave because every candidate there feeds one normalisation. A batch
 in which *every* item failed is still a `200`: the request was served, the
-items were not, and the results say which. Only something that invalidates the
-whole request — no `items`, no `questions`, a question set that does not
-validate, an unknown mode, too many items — answers from the error table.
+items were not, and the results say which. What answers from the error table
+instead is anything that invalidates the whole request: no `items`, no
+`questions`, a question set that does not validate, an unknown mode, too many
+items, a body over the size limit, a key that could not be resolved (`401`),
+the evaluation outrunning `PERCEPTEA_REQUEST_TIMEOUT` (`504`), and the caller
+hanging up (`499`).
+
+**A failed item carries `error_code` beside its `error`**, from the same
+vocabulary the error table uses — `upstream_rate_limited`, `upstream_error`,
+`timeout`, `invalid_request`, `unsupported_mode` — so a per-item failure can
+be branched on the way a per-request one can, and a rate limit worth backing
+off from is tellable from a provider that is simply unwell. The `error`
+itself is the message `/api/evaluate` would have put in an error body for the
+same fault: a failure whose own text is the diagnosis says so, and one that
+never reached the provider says only that, because its text names the
+endpoint this server calls and the caller may not be allowed to know it. The
+detail goes to the log line instead.
 
 `meta.succeeded` and `meta.failed` let you tell a wholly successful batch from
 a partly successful one without walking the results. `usage` totals every
@@ -658,10 +676,15 @@ items against a question set with *c* candidates issues *n × c* calls under
 one request, so the ceiling is what stops one caller committing the server's
 key to an unbounded amount of it. The example above is 3 items × 4 candidates
 — three options plus a noul — so 12 were planned and `parallel_calls` reports
-10: two of the third item's four had come back when the next one was rate
-limited, and its remaining candidates were abandoned rather than issued.
-`parallel_calls` counts what reached the provider, which is why the failed
-item still reports the usage of the two that did.
+12: all of them had been issued by the time the rate limit came back. The
+counter increments when a call is *issued*, not when it returns, so the
+rate-limited call counts itself, and so does the third item's fourth
+candidate, which was already in flight when its sibling failed and was
+cancelled there. `usage` counts what came back instead, which is why the
+failed item still reports the two candidates that answered before the rate
+limit did. Had the rate limit arrived sooner, a candidate still queued behind
+the concurrency budget would have been abandoned rather than issued and
+`parallel_calls` would be lower.
 
 `PERCEPTEA_MAX_BODY_BYTES` (default 2 MiB) is about the wire, and it is shared
 with `/api/evaluate` rather than raised for batches. The arithmetic: the
@@ -669,12 +692,20 @@ question set is sent once, so 2 MiB across 100 items leaves roughly **21 KB
 per state**. Support tickets, reviews and log lines — what this service is
 for — run a few hundred bytes to a couple of kilobytes, so a full batch of
 them is 50–200 KB and nowhere near the limit. It binds only on states
-averaging over about 21 KB, which is some five thousand words each; at that
-size the context window and the fan-out cost are the real constraints, not the
-body limit. So the default stands: raise `PERCEPTEA_MAX_BODY_BYTES` if you
-batch documents rather than messages, and leave it alone otherwise.
+averaging over about 21 KB, which is some three and a half thousand words
+each; at that size the context window and the fan-out cost are the real
+constraints, not the body limit. So the default stands: raise
+`PERCEPTEA_MAX_BODY_BYTES` if you batch documents rather than messages, and
+leave it alone otherwise.
 
-A request over either limit is a `400 invalid_request` naming the setting.
+The two limits answer differently, because they are found at different
+points. Too many items is a `400 invalid_request` naming
+`PERCEPTEA_MAX_BATCH_ITEMS`, the ceiling and the count you sent: the body was
+read and understood, and only then was it too big a job. A body over the byte
+limit is a `413 payload_too_large` naming the limit in bytes, because the
+read is cut short before there is a document to count items in — the item
+ceiling is this endpoint's, but the byte limit is shared with
+`/api/evaluate` and answers the same way there.
 
 ### `GET /api/health`
 
@@ -724,7 +755,12 @@ instead.
 
 The table is for failures of the *request*. On `/api/evaluate/batch` an item
 that failed is not one of those: it answers `200` with the reason in that
-item's `error`, scrubbed of credentials like any other message on its way out.
+item's `error` and the code in its `error_code`. Both come from this same
+table — an item is told what a request would have been told, minus the
+status, which a served request has no second one of. The message is
+scrubbed of credentials like any other on its way out, and a failure this
+server cannot vouch for is reported as the same opaque upstream error a
+`502` carries, with its text kept for the log.
 
 ## Question types
 
@@ -789,7 +825,17 @@ the criteria before any call is made:
 |---|---|---|
 | `choice` | an option key, as a string — `"billing"` | it is not one of the declared keys |
 | `score` | a level index, as a whole number — `2` | it is outside the declared scale |
-| `noul` / `boolean` | `true` or `false` | — |
+| `noul` / `boolean` | `true` or `false` | — (only the rule below) |
+
+**Every type rejects an example with no `answer`**, and `"answer": null`
+counts as none: `example 0 is missing "answer"`. The two are one omission and
+get one message. It is checked before the type-specific rule above rather
+than left to it, because only `choice` would have caught it — `null` decodes
+into a number and into a boolean without complaint and leaves the zero value,
+so a `score` example would teach level `0` and a `noul` example would teach
+`false`, neither of which the request said. `perceptea-bench` applies the
+same rule to a dataset line, where a fabricated label would be scored against
+rather than shown to the model.
 
 `state` takes the same shapes a request's own state does — a string, an object
 or an array — and is required on every example.
@@ -928,9 +974,21 @@ statistic rounded, so two runs diff cleanly — which is the point. Reach for
 this before and after changing a model, a scorer or a prompt; without it, "the
 new one is better" is an opinion.
 
+**Interrupting a run does not throw it away.** Ctrl-C stops the dispatch,
+prints the report for the attempts that did finish, and exits non-zero saying
+how many there were: a hundred cases stopped at sixty measured sixty cases,
+and those cost real calls. The non-zero exit is what stops a script filing a
+partial document as a complete one.
+
 It needs a real key and makes real calls, so it is a tool rather than a test.
 `cmd/perceptea-bench/example.jsonl` is a runnable seven-case dataset covering
-all three question types.
+all three question types. Everything else it needs comes from the same
+environment the server reads — the endpoint, the key, the model, the
+temperature, `PERCEPTEA_SCORER`, `PERCEPTEA_MAX_CONCURRENCY` and
+`PERCEPTEA_REQUEST_TIMEOUT` — so a benchmark measures the configuration you
+are actually serving. A credential carried in `PERCEPTEA_INFERENCE_BASE_URL`
+is struck out of any failure the report records, because the `-json` document
+is one you are being told to store and diff.
 
 ## Contributing
 

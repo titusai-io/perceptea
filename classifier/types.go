@@ -361,6 +361,17 @@ func decodeExamples(t QuestionType, wire []exampleWire) ([]Example, error) {
 		if w.State.IsZero() {
 			return nil, fmt.Errorf("example %d is missing %q", i, "state")
 		}
+		// An example that answers nothing is caught here rather than left to
+		// the decode below, because two of the three types would not catch it
+		// at all: JSON null unmarshals into an int and into a bool without
+		// error and leaves the Go zero value, so a score would teach level 0
+		// and a noul would teach false — an answer the request never gave,
+		// shown to the model on every candidate of the question. A choice
+		// escapes that only because "" is not a declared option key, which
+		// makes the three types disagree over the same document.
+		if answerIsMissing(w.Answer) {
+			return nil, fmt.Errorf("example %d is missing %q", i, "answer")
+		}
 		switch t {
 		case TypeChoice:
 			if err := json.Unmarshal(w.Answer, &ex.Choice); err != nil {
@@ -378,6 +389,14 @@ func decodeExamples(t QuestionType, wire []exampleWire) ([]Example, error) {
 		out = append(out, ex)
 	}
 	return out, nil
+}
+
+// answerIsMissing reports whether an example gave no answer at all: the key
+// was left out, or it was written as null. The two are the same omission, and
+// are worth the same message.
+func answerIsMissing(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
 }
 
 // MarshalJSON writes the question back in its wire shape, with the type as it

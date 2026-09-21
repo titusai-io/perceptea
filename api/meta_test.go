@@ -155,7 +155,45 @@ func TestNewServerFillsInMissingLimits(t *testing.T) {
 	if cfg.MaxBodyBytes != config.DefaultMaxBodyBytes {
 		t.Errorf("MaxBodyBytes = %d, want %d", cfg.MaxBodyBytes, config.DefaultMaxBodyBytes)
 	}
+	if cfg.MaxBatchItems != config.DefaultMaxBatchItems {
+		t.Errorf("MaxBatchItems = %d, want %d", cfg.MaxBatchItems, config.DefaultMaxBatchItems)
+	}
+	// A configuration with no scorer named has not chosen one, so it takes
+	// the default like every limit above it.
+	if cfg.Scorer != config.DefaultScorer {
+		t.Errorf("Scorer = %q, want %q", cfg.Scorer, config.DefaultScorer)
+	}
 	if srv.Handler() == nil {
 		t.Error("Handler() is nil")
+	}
+}
+
+// TestNewServerRejectsAnUnknownScorer: a scorer this server does not know
+// cannot be normalised into one that it does — the two are different
+// estimators, and choosing on the caller's behalf would answer every request
+// from the one they had just ruled out. Before, it started and failed every
+// request with a generic 500 while /api/health still said ok.
+func TestNewServerRejectsAnUnknownScorer(t *testing.T) {
+	_, err := NewServer(Options{Config: config.Config{Scorer: "logits"}})
+
+	if err == nil {
+		t.Fatal("NewServer accepted a scorer it cannot serve")
+	}
+	for _, want := range []string{config.EnvScorer, "logits", config.ScorerChat, config.ScorerLogprob} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q", err, want)
+		}
+	}
+
+	// Both real scorers are still accepted, so the check cannot be passing by
+	// rejecting everything.
+	for _, scorer := range []string{config.ScorerChat, config.ScorerLogprob} {
+		srv, err := NewServer(Options{Config: config.Config{Scorer: scorer}})
+		if err != nil {
+			t.Fatalf("NewServer with %s=%q: %v", config.EnvScorer, scorer, err)
+		}
+		if got := srv.Config().Scorer; got != scorer {
+			t.Errorf("Scorer = %q, want %q", got, scorer)
+		}
 	}
 }

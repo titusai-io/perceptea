@@ -113,6 +113,36 @@ func TestParseDatasetDefaultsTheIDAndTheQuestionName(t *testing.T) {
 	}
 }
 
+// TestDefaultQuestionNameIsPinned: the name is not a label on a slot.
+//
+// A question that declares no instructions has its prompt built from its
+// name, so the default reaches the model and is part of what the run
+// measured; and it is the key the answer is looked up by, so a run that
+// asked under one name and read under another measures nothing at all.
+// Changing it silently changes both, in a way no other test here would see:
+// the name is used for the question and for the lookup, so it stays
+// consistent with itself whatever it is.
+func TestDefaultQuestionNameIsPinned(t *testing.T) {
+	if DefaultQuestionName != "answer" {
+		t.Errorf("DefaultQuestionName = %q, want %q: it reaches the prompt and keys the answer",
+			DefaultQuestionName, "answer")
+	}
+
+	// The name is a question's only instruction when it declares none, so
+	// this is the text the model is asked about.
+	cases := parseAll(t, `{"state":"x","question":{"type":"noul"},"answer":true}`)
+	statement := classifier.NoulStatement(cases[0].Name, cases[0].Question.Instructions)
+	if !strings.Contains(statement, DefaultQuestionName) {
+		t.Errorf("the prompt for an unnamed question is %q, want it to carry %q",
+			statement, DefaultQuestionName)
+	}
+
+	// And it is the key the run reads the answer back under.
+	if keys := cases[0].Request("m", 0).Questions.Keys(); len(keys) != 1 || keys[0] != DefaultQuestionName {
+		t.Errorf("the request asks under %v, want [%q]", keys, DefaultQuestionName)
+	}
+}
+
 func TestParseDatasetNamesTheLineThatWillNotParse(t *testing.T) {
 	msg := parseError(t, noulLine, `{"state":`, noulLine)
 

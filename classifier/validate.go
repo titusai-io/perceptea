@@ -185,6 +185,13 @@ func validateCriteria(name string, q Question) error {
 // example is paid for on every call of the wave, so a wrong one is wrong many
 // times over. It is caught here, before any call is made, rather than at
 // prompt-building time, where there is nowhere good to report it.
+//
+// "Can actually be shown" includes the state rendering at all, not only being
+// present. A state carrying bytes that are not JSON is not zero, so nothing
+// else here objects to it, and [ExamplesBlock] is then the first thing to try
+// them — which is exactly the prompt-building time this check exists to get
+// ahead of. It is reachable only from a [State] built in Go, because the wire
+// decoder rejects those bytes on the way in.
 func validateExamples(name string, q Question) error {
 	for i, ex := range q.Examples {
 		if ex.State.IsZero() {
@@ -192,6 +199,13 @@ func validateExamples(name string, q Question) error {
 				Question: name,
 				Field:    "examples",
 				Message:  fmt.Sprintf("example %d has no state", i),
+			}
+		}
+		if _, err := ex.State.Text(); err != nil {
+			return &ValidationError{
+				Question: name,
+				Field:    "examples",
+				Message:  fmt.Sprintf("example %d has a state that cannot be rendered: %v", i, err),
 			}
 		}
 		switch q.Type {

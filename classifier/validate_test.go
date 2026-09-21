@@ -2,6 +2,7 @@ package classifier
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -257,6 +258,35 @@ func TestValidateRejects(t *testing.T) {
 			wantField:    "examples",
 			wantMessage:  "example 0 has no state",
 		},
+		// An example whose state is present but not renderable is the one
+		// fault that used to survive Validate: it has bytes, so it is not
+		// zero, and nothing tried to render them until the prompt was being
+		// built — where the failure is a plain error with no question name
+		// on it and no way for a caller to tell it from an upstream one.
+		{
+			name: "an example whose state is not valid JSON",
+			qs: one("angry", Question{
+				Type:     TypeNoul,
+				Examples: []Example{{State: RawState(json.RawMessage(`{"broken":`)), Noul: true}},
+			}),
+			wantQuestion: "angry",
+			wantField:    "examples",
+			wantMessage:  "example 0 has a state that cannot be rendered",
+		},
+		{
+			name: "an example whose state is not valid JSON on a choice question",
+			qs: one("department", Question{
+				Type:    TypeChoice,
+				Options: *optionsOf("billing"),
+				Examples: []Example{
+					{State: StringState("charged twice"), Choice: "billing"},
+					{State: RawState(json.RawMessage(`[1,`)), Choice: "billing"},
+				},
+			}),
+			wantQuestion: "department",
+			wantField:    "examples",
+			wantMessage:  "example 1 has a state that cannot be rendered",
+		},
 		{
 			name:         "an unknown question type",
 			qs:           one("ranking", Question{Type: "ranking"}),
@@ -365,6 +395,49 @@ func TestABadExampleIsRejectedBeforeAnyCallIsMade(t *testing.T) {
 	}
 	if n := calls.Load(); n != 0 {
 		t.Errorf("the scorer was called %d times; a request with a bad example must not reach a provider", n)
+	}
+}
+
+// The same claim for the fault that used to get past [Validate] and fail
+// inside the renderer instead. A caller reaching Evaluate with it got a plain
+// error: no *ValidationError to inspect, no question named, and — alone in
+// this package — no "classifier:" on the front of it.
+func TestAnUnrenderableExampleStateIsAValidationErrorFromEvaluate(t *testing.T) {
+	var calls atomic.Int64
+	e := New(ScorerFunc(func(context.Context, ScoreRequest) (ScoreResult, error) {
+		calls.Add(1)
+		return ScoreResult{Probability: 0.5}, nil
+	}))
+
+	// Only a programmatically built state can be this: the wire decoder would
+	// have rejected the bytes on the way in.
+	qs := one("angry", Question{
+		Type:     TypeNoul,
+		Examples: []Example{{State: RawState(json.RawMessage(`{"broken":`)), Noul: true}},
+	})
+
+	_, err := e.Evaluate(context.Background(), Request{State: StringState("s"), Questions: qs})
+	var verr *ValidationError
+	if !errors.As(err, &verr) {
+		t.Errorf("Evaluate returned %T (%v), want a *ValidationError", err, err)
+	} else if verr.Question != "angry" || verr.Field != "examples" {
+		t.Errorf("validation error named %q/%q, want angry/examples", verr.Question, verr.Field)
+	}
+	if err != nil && !strings.HasPrefix(err.Error(), "classifier:") {
+		t.Errorf("error %q does not start with the package's prefix", err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("the scorer was called %d times; a question whose examples cannot be rendered must not reach a provider", n)
+	}
+
+	// A batch shares the question set, so the same fault fails the request
+	// rather than each of its items separately.
+	_, berr := e.EvaluateBatch(context.Background(), BatchRequest{
+		Items:     []BatchItem{{ID: "t-0", State: StringState("s")}},
+		Questions: qs,
+	})
+	if !errors.As(berr, &verr) {
+		t.Errorf("EvaluateBatch returned %T (%v), want a *ValidationError", berr, berr)
 	}
 }
 

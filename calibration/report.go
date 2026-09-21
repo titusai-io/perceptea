@@ -55,7 +55,11 @@ type Failure struct {
 	ID      string `json:"id"`
 	Line    int    `json:"line"`
 	Attempt int    `json:"attempt"`
-	Reason  string `json:"reason"`
+	// Reason is the failure's text exactly as the run recorded it. A run made
+	// by [Runner] has already had [Runner.Scrub] applied to it, which is
+	// where a credential quoted out of a base URL is removed; a Run assembled
+	// by hand carries whatever its outcomes carry.
+	Reason string `json:"reason"`
 }
 
 // ChoiceMetrics summarises the choice cases.

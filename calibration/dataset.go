@@ -2,6 +2,7 @@ package calibration
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -148,13 +149,30 @@ func decodeCase(line int, data []byte) (Case, error) {
 		return Case{}, fmt.Errorf("case %q: %w", c.ID, err)
 	}
 
-	if len(wire.Answer) == 0 {
+	// An explicit null counts as no label at all, and is caught here rather
+	// than left to the type-specific decode below, because two of the three
+	// types would not catch it. json.Unmarshal reads null into an int and
+	// into a bool without error and leaves the Go zero value, so a score
+	// labelled null would become level 0 and a noul would become false — a
+	// label the file never gave, and one every metric in the report is then
+	// computed against. A choice escapes only because "" is not a declared
+	// option key, which is what made the three types disagree about the same
+	// line.
+	if answerIsMissing(wire.Answer) {
 		return Case{}, fmt.Errorf("case %q is missing %q", c.ID, "answer")
 	}
 	if err := c.decodeAnswer(wire.Answer); err != nil {
 		return Case{}, fmt.Errorf("case %q: %w", c.ID, err)
 	}
 	return c, nil
+}
+
+// answerIsMissing reports whether a line gave no label at all: the key was
+// left out, or it was written as null. The two are the same omission and are
+// worth the same message.
+func answerIsMissing(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
 }
 
 // decodeAnswer reads the label in the terms its question type uses.

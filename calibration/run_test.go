@@ -193,6 +193,168 @@ func TestRunnerKeepsDatasetOrderUnderConcurrency(t *testing.T) {
 	}
 }
 
+// TestRunnerTimeoutBoundsOneAttempt: the deadline is per attempt, not per
+// run. A provider that accepts a connection and then says nothing would
+// otherwise stop the whole benchmark on its first case, and a deadline that
+// covered the run would kill every case after the first slow one.
+func TestRunnerTimeoutBoundsOneAttempt(t *testing.T) {
+	scorer := &stateScorer{
+		probabilities: map[string]float64{"slow": 0.6, "quick": 0.9},
+		// Long enough that the deadline decides, short enough that a run
+		// without one finishes rather than hanging the suite.
+		delays: map[string]time.Duration{"slow": 2 * time.Second},
+	}
+	runner := Runner{
+		Evaluator: classifier.New(scorer),
+		Timeout:   50 * time.Millisecond,
+	}
+
+	// The slow case first and one at a time, so the quick one starts after
+	// the deadline has already expired once: it answers only if each attempt
+	// gets a deadline of its own.
+	run, err := runner.Run(context.Background(), noulDataset(t, "slow", "quick"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if !errors.Is(run.Outcomes[0].Err, context.DeadlineExceeded) {
+		t.Errorf("the slow case failed with %v, want %v", run.Outcomes[0].Err, context.DeadlineExceeded)
+	}
+	if run.Outcomes[1].Err != nil {
+		t.Errorf("the case after the timeout failed too (%v): the deadline is not per attempt", run.Outcomes[1].Err)
+	}
+	if run.Outcomes[1].Answer.Noul != 0.9 {
+		t.Errorf("the case after the timeout answered %v, want 0.9", run.Outcomes[1].Answer.Noul)
+	}
+}
+
+// Zero means the run's own context is the only deadline, so a slow case is
+// not quietly cut off by a runner nobody configured.
+func TestRunnerWithoutATimeoutWaits(t *testing.T) {
+	scorer := &stateScorer{
+		probabilities: map[string]float64{"slow": 0.6},
+		delays:        map[string]time.Duration{"slow": 20 * time.Millisecond},
+	}
+
+	run, err := Runner{Evaluator: classifier.New(scorer)}.Run(context.Background(), noulDataset(t, "slow"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if run.Outcomes[0].Err != nil {
+		t.Errorf("the slow case failed with no timeout set: %v", run.Outcomes[0].Err)
+	}
+}
+
+// TestRunnerConcurrencyRunsThatManyCasesAtOnce: Concurrency is how many
+// cases are in flight, and nothing else in this package observes more than
+// one.
+func TestRunnerConcurrencyRunsThatManyCasesAtOnce(t *testing.T) {
+	const (
+		inFlight = 3
+		cases    = 5
+	)
+	scorer := &blockingScorer{
+		started: make(chan struct{}, cases),
+		release: make(chan struct{}),
+	}
+	runner := Runner{Evaluator: classifier.New(scorer), Concurrency: inFlight}
+
+	states := make([]string, cases)
+	for i := range states {
+		states[i] = fmt.Sprintf("s%d", i)
+	}
+	done := make(chan Run, 1)
+	go func() {
+		run, err := runner.Run(context.Background(), noulDataset(t, states...))
+		if err != nil {
+			t.Errorf("Run: %v", err)
+		}
+		done <- run
+	}()
+
+	// One blocking receive per case that should have started. It cannot pass
+	// early, so a runner that serialised its cases hangs here rather than
+	// reporting a false pass — the timeout turns that into a message.
+	for i := range inFlight {
+		select {
+		case <-scorer.started:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d cases were in flight, want %d", i, inFlight)
+		}
+	}
+	// And the fourth is the one that must not arrive: a runner with no bound
+	// at all is not what Concurrency means either.
+	select {
+	case <-scorer.started:
+		t.Fatalf("a %dth case started, above the limit of %d", inFlight+1, inFlight)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(scorer.release)
+	if run := <-done; len(run.Outcomes) != cases {
+		t.Errorf("got %d outcomes, want %d", len(run.Outcomes), cases)
+	}
+}
+
+// TestRunnerScrubsWhatAFailureQuotes is the defect: the reason recorded for a
+// failed attempt goes straight into the -json document people store and
+// diff, and a provider error quotes the URL it was calling.
+func TestRunnerScrubsWhatAFailureQuotes(t *testing.T) {
+	const secret = "QUERYSECRET-zzz999"
+	sentinel := errors.New("the original")
+	quoted := fmt.Errorf(
+		`inference: chat completion: Post "http://llm.internal.corp:8443/v1?api-key=%s/chat/completions": refused: %w`,
+		secret, sentinel)
+	scorer := &stateScorer{errs: map[string]error{"clouds": quoted}}
+	runner := Runner{
+		Evaluator: classifier.New(scorer),
+		Scrub:     func(s string) string { return strings.ReplaceAll(s, secret, "[redacted]") },
+	}
+
+	run, err := runner.Run(context.Background(), noulDataset(t, "clouds"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	recorded := run.Outcomes[0].Err
+	if recorded == nil {
+		t.Fatal("the failing case reported no error")
+	}
+	if strings.Contains(recorded.Error(), secret) {
+		t.Errorf("the recorded failure carries the credential: %v", recorded)
+	}
+	if !strings.Contains(recorded.Error(), "[redacted]") {
+		t.Errorf("nothing was redacted, so Scrub never ran: %v", recorded)
+	}
+	// The report is where it would have been written down.
+	reason := Summarise(run).Coverage.Failures[0].Reason
+	if strings.Contains(reason, secret) {
+		t.Errorf("the report carries the credential: %q", reason)
+	}
+	// Wrapping the text must not cost the error its identity.
+	if !errors.Is(recorded, sentinel) {
+		t.Errorf("errors.Is no longer reaches the original error: %v", recorded)
+	}
+}
+
+// Without a scrubber the reason is recorded as it came: this package does not
+// decide what is a secret, and inventing a redaction would hide a hostname an
+// operator needs.
+func TestRunnerWithoutAScrubberRecordsTheTextAsItCame(t *testing.T) {
+	const text = "inference: chat completion: refused"
+	scorer := &stateScorer{errs: map[string]error{"clouds": errors.New(text)}}
+
+	run, err := Runner{Evaluator: classifier.New(scorer)}.Run(context.Background(), noulDataset(t, "clouds"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := run.Outcomes[0].Err.Error(); got != text {
+		t.Errorf("recorded %q, want %q", got, text)
+	}
+}
+
 func TestRunnerNeedsAnEvaluator(t *testing.T) {
 	_, err := Runner{}.Run(context.Background(), noulDataset(t, "clouds"))
 
