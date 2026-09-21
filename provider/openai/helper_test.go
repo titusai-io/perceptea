@@ -1,0 +1,184 @@
+package openai
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+	"time"
+)
+
+// testKey is the only API key used anywhere in these tests. It is deliberately
+// distinctive so that a leak assertion can search for it.
+const testKey = "sk-test-DO-NOT-LEAK-6f2a1c"
+
+// capturedRequest is one request as the fake endpoint saw it.
+type capturedRequest struct {
+	method string
+	path   string
+	header http.Header
+	raw    []byte
+}
+
+// body decodes the captured request into a generic map, so a test can assert
+// on the absence of a field as easily as on its value.
+func (r capturedRequest) body(t *testing.T) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(r.raw, &out); err != nil {
+		t.Fatalf("captured body is not JSON: %v\nbody: %s", err, r.raw)
+	}
+	return out
+}
+
+// format reports the response_format type of the captured request, or "" when
+// the request carried none.
+func (r capturedRequest) format(t *testing.T) string {
+	t.Helper()
+	rf, ok := r.body(t)["response_format"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := rf["type"].(string)
+	return s
+}
+
+// fakeAPI is an OpenAI-compatible endpoint that records what it was sent.
+type fakeAPI struct {
+	*httptest.Server
+
+	mu       sync.Mutex
+	captured []capturedRequest
+}
+
+// newFakeAPI starts a server whose handler is called with the zero-based index
+// of the request, so a test can behave differently on each attempt.
+func newFakeAPI(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, n int)) *fakeAPI {
+	t.Helper()
+	api := &fakeAPI{}
+	api.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		// Hand the body back so a handler can inspect it too.
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		api.mu.Lock()
+		n := len(api.captured)
+		api.captured = append(api.captured, capturedRequest{
+			method: r.Method,
+			path:   r.URL.Path,
+			header: r.Header.Clone(),
+			raw:    raw,
+		})
+		api.mu.Unlock()
+		handle(w, r, n)
+	}))
+	t.Cleanup(api.Close)
+	return api
+}
+
+// alwaysJSON starts a server that answers every request with the same JSON
+// document and a 200.
+func alwaysJSON(t *testing.T, document string) *fakeAPI {
+	t.Helper()
+	return newFakeAPI(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		writeJSON(w, http.StatusOK, document)
+	})
+}
+
+// count reports how many requests reached the server.
+func (a *fakeAPI) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.captured)
+}
+
+// request returns the i-th captured request.
+func (a *fakeAPI) request(t *testing.T, i int) capturedRequest {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if i >= len(a.captured) {
+		t.Fatalf("want at least %d requests, got %d", i+1, len(a.captured))
+	}
+	return a.captured[i]
+}
+
+// writeJSON sends a canned response body.
+func writeJSON(w http.ResponseWriter, status int, document string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, document)
+}
+
+// scoreBody builds a minimal successful completion carrying the given content.
+func scoreBody(content string) string {
+	raw, _ := json.Marshal(content)
+	return `{"choices":[{"message":{"role":"assistant","content":` + string(raw) + `}}]}`
+}
+
+// sleepLog records the backoffs a client asked for instead of serving them.
+type sleepLog struct {
+	mu    sync.Mutex
+	calls []time.Duration
+}
+
+func (s *sleepLog) record(ctx context.Context, d time.Duration) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, d)
+	s.mu.Unlock()
+	return ctx.Err()
+}
+
+func (s *sleepLog) durations() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Duration(nil), s.calls...)
+}
+
+// logSink is a slog handler writing into a buffer a test can inspect.
+type logSink struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *logSink) handler() slog.Handler {
+	return slog.NewJSONHandler(l, &slog.HandlerOptions{Level: slog.LevelDebug})
+}
+
+func (l *logSink) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logSink) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// newTestClient builds a client pointed at api, with logging discarded and
+// sleeping recorded rather than performed. mutate may adjust the config first.
+func newTestClient(t *testing.T, api *fakeAPI, mutate func(*Config)) (*Client, *sleepLog) {
+	t.Helper()
+	cfg := Config{
+		APIKey:  testKey,
+		BaseURL: api.URL,
+		Model:   "config-model",
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sleeps := &sleepLog{}
+	client.sleep = sleeps.record
+	return client, sleeps
+}

@@ -1,0 +1,298 @@
+package openai
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"math"
+	"regexp"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"github.com/titusai-io/perceptea/classifier"
+)
+
+// scoreSystemPrompt is the calibrated-estimator instruction every scoring call
+// is made under. The probabilities a model returns are calibrated against this
+// exact wording, so editing it moves the numbers.
+const scoreSystemPrompt = "You are a calibrated probability estimator. " +
+	"Given a STATE and a STATEMENT, return only how likely the statement is true " +
+	"based solely on the state. Do not invent facts. " +
+	`Respond with JSON: {"p": <number 0 to 1>}.`
+
+// scoreUserSuffix closes the user turn. The dash is an en dash (U+2013), not a
+// hyphen; changing it changes the prompt, and so the probabilities.
+const scoreUserSuffix = "\n\nHow likely is the statement true (0–1)?"
+
+// maxScoreTokens caps the reply. The answer is a handful of characters; the
+// cap is what keeps a chatty model from turning one score into an essay.
+const maxScoreTokens = 32
+
+// fallbackProbability is the answer when nothing usable comes back. A
+// candidate that cannot be read is maximally uninformative, not an error: one
+// bad candidate should blunt one score, not fail the whole evaluation.
+const fallbackProbability = 0.5
+
+// scoreSchemaName is the json_schema name sent at level one.
+const scoreSchemaName = "prob"
+
+// scoreSchema constrains the reply to {"p": <0..1>} and nothing else.
+var scoreSchema = json.RawMessage(
+	`{"type":"object","properties":{"p":{"type":"number","minimum":0,"maximum":1}},"required":["p"],"additionalProperties":false}`,
+)
+
+// probabilityPattern is the salvage regexp, matching the first decimal
+// fraction or bare 0/1 in a reply that is not JSON.
+var probabilityPattern = regexp.MustCompile(`0?\.\d+|[01](?:\.0+)?`)
+
+// Score asks the model how likely one statement is, given one state, and
+// returns the probability with the tokens it cost.
+//
+// The call starts at the client's current structured-output level and steps
+// down a level whenever the provider rejects the request shape, so a provider
+// that cannot do json_schema still answers on the first Score call.
+//
+// The step is only remembered — for every later call, on this client — once a
+// lower level has actually answered. That is the honest signal: a provider
+// that genuinely cannot do json_schema succeeds at json_object, and the
+// client should never ask again. A request that fails at all three levels was
+// failing for some other reason, and leaves the level where it found it, so
+// one bad model name or one over-long prompt cannot quietly strip structured
+// output from every later request the client serves.
+//
+// Anything short of a transport or API failure yields a probability: an empty
+// choices list, an unparseable reply and a reply with no number in it all
+// degrade to 0.5 rather than returning an error.
+func (c *Client) Score(ctx context.Context, req classifier.ScoreRequest) (classifier.ScoreResult, error) {
+	model, err := c.resolveModel(req.Model)
+	if err != nil {
+		return classifier.ScoreResult{}, err
+	}
+
+	messages := []chatMessage{
+		{Role: "system", Content: scoreSystemPrompt},
+		{Role: "user", Content: "STATE:\n" + req.State + "\n\nSTATEMENT:\n" + req.Statement + scoreUserSuffix},
+	}
+
+	started := c.outputLevel()
+	// The level strictly increases on every step and the step is only taken
+	// while a response_format was sent, which stops at levelPlain, so this
+	// loop runs at most once per level.
+	for level := started; ; level++ {
+		body := chatRequest{
+			Model:          model,
+			Messages:       messages,
+			Temperature:    req.Temperature,
+			MaxTokens:      maxScoreTokens,
+			ResponseFormat: scoreResponseFormat(level),
+		}
+
+		resp, err := c.complete(ctx, body)
+		if err == nil {
+			if level > started {
+				c.downgrade(level)
+			}
+			return scoreResult(resp), nil
+		}
+		if body.ResponseFormat != nil && unsupportedShape(err) {
+			continue
+		}
+		return classifier.ScoreResult{}, err
+	}
+}
+
+// scoreResponseFormat renders the response_format for a level, or nil at the
+// plain level.
+func scoreResponseFormat(level outputLevel) *responseFormat {
+	switch level {
+	case levelJSONSchema:
+		return &responseFormat{
+			Type: "json_schema",
+			JSONSchema: &jsonSchemaSpec{
+				Name:   scoreSchemaName,
+				Strict: true,
+				Schema: scoreSchema,
+			},
+		}
+	case levelJSONObject:
+		return &responseFormat{Type: "json_object"}
+	default:
+		return nil
+	}
+}
+
+// scoreResult turns a completion into a score.
+func scoreResult(resp *chatResponse) classifier.ScoreResult {
+	out := classifier.ScoreResult{
+		Probability:  fallbackProbability,
+		InputTokens:  resp.Usage.PromptTokens,
+		OutputTokens: resp.Usage.CompletionTokens,
+	}
+	if len(resp.Choices) == 0 {
+		return out
+	}
+	raw := string(resp.Choices[0].Message.Content)
+	if strings.TrimSpace(raw) == "" {
+		// Some providers put everything in a reasoning field and leave
+		// content null.
+		raw = string(resp.Choices[0].Message.Reasoning)
+	}
+	out.Probability = probabilityFrom(raw)
+	return out
+}
+
+// probabilityFrom reads a probability out of a model reply, forgivingly and in
+// this order: parse the reply as JSON and read "p" then "probability"; failing
+// that, salvage the first number in the raw text; failing that, 0.5. A
+// markdown fence around the JSON is stripped first.
+//
+// The salvage regexp only runs on a reply that is not JSON at all. A reply
+// that is JSON is read as JSON or not at all: once a reply has a structure,
+// the structure is what it meant, and scraping a number out of a document
+// that put none under "p" would promote some other field to an answer.
+func probabilityFrom(raw string) float64 {
+	if candidate := strings.TrimSpace(stripFence(raw)); candidate != "" {
+		var doc json.RawMessage
+		if err := json.Unmarshal([]byte(candidate), &doc); err == nil {
+			return clamp01(probabilityFromJSON(doc))
+		}
+	}
+	if match := probabilityPattern.FindString(raw); match != "" {
+		if v, err := strconv.ParseFloat(match, 64); err == nil {
+			return clamp01(v)
+		}
+	}
+	return fallbackProbability
+}
+
+// probabilityFromJSON reads the probability out of a reply that did parse as
+// JSON.
+//
+// Three rules govern how generously a reply is read. All three pull the same
+// way: take the answer a model plainly meant, but never invent confidence the
+// reply does not carry.
+//
+//   - "p" and "probability" are matched case-insensitively, because that is
+//     how encoding/json resolves a field name. A model that shouts its key
+//     still means the same thing, and no other key can collide with these two.
+//   - A value that is present but not a number at all — {"p":""}, {"p":" "},
+//     {"p":[]} — is read as no answer, so the reply falls back to 0.5.
+//     Coercing an empty string to 0 would report a confident "certainly false"
+//     on the strength of a field the model left blank.
+//   - A bare top-level number is accepted. A reply of exactly 0.28 is an
+//     answer to the question that was asked, and throwing it away for want of
+//     a wrapping object would discard a probability the model did report.
+func probabilityFromJSON(doc json.RawMessage) float64 {
+	var obj struct {
+		P           json.RawMessage `json:"p"`
+		Probability json.RawMessage `json:"probability"`
+	}
+	if err := json.Unmarshal(doc, &obj); err == nil {
+		if v, ok := numberFrom(obj.P); ok {
+			return v
+		}
+		if v, ok := numberFrom(obj.Probability); ok {
+			return v
+		}
+		return fallbackProbability
+	}
+	// Not an object. A bare number is unambiguous — but only while it is
+	// already a probability. Clamping a bare 12 or 85 to 1 would turn a reply
+	// that plainly is not a probability into maximum confidence, and so would
+	// handing it to the salvage regexp, which reads the leading "1" out of 12
+	// and out of 100. Out of range, the reply says nothing usable, and the
+	// fallback is the honest answer.
+	if v, ok := numberFrom(doc); ok && v >= 0 && v <= 1 {
+		return v
+	}
+	return fallbackProbability
+}
+
+// numberFrom coerces a JSON value to a number: numbers pass through, numeric
+// strings are parsed, booleans become 1 and 0, and anything non-finite
+// collapses to the fallback. Anything else reports that it is not a number at
+// all, which is what keeps a blank field from being read as a zero.
+func numberFrom(raw json.RawMessage) (float64, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, false
+	}
+
+	var f float64
+	if err := json.Unmarshal(trimmed, &f); err == nil {
+		return finite(f), true
+	}
+
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		if err != nil {
+			return 0, false
+		}
+		return finite(v), true
+	}
+
+	var b bool
+	if err := json.Unmarshal(trimmed, &b); err == nil {
+		if b {
+			return 1, true
+		}
+		return 0, true
+	}
+
+	return 0, false
+}
+
+// finite replaces a NaN or an infinity with the fallback.
+func finite(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return fallbackProbability
+	}
+	return v
+}
+
+// clamp01 confines a probability to [0,1].
+func clamp01(v float64) float64 {
+	switch {
+	case math.IsNaN(v):
+		return fallbackProbability
+	case v < 0:
+		return 0
+	case v > 1:
+		return 1
+	default:
+		return v
+	}
+}
+
+// stripFence removes a surrounding markdown code fence, with or without a
+// language tag. Text that is not fenced is returned unchanged.
+func stripFence(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "```") {
+		return s
+	}
+	body := trimmed[3:]
+	if end := strings.LastIndex(body, "```"); end >= 0 {
+		body = body[:end]
+	}
+	if i := strings.IndexFunc(body, unicode.IsSpace); i > 0 && isLanguageTag(body[:i]) {
+		body = body[i:]
+	}
+	return strings.TrimSpace(body)
+}
+
+// isLanguageTag reports whether a fence's first token looks like "json" rather
+// than the start of the payload.
+func isLanguageTag(s string) bool {
+	if s == "" || len(s) > 16 {
+		return false
+	}
+	for _, r := range s {
+		if r != '-' && r != '_' && r != '+' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
