@@ -100,6 +100,85 @@ func NoulStatement(name, instructions string) string {
 	return statement
 }
 
+// The labels of the worked-examples block. They are spelled the way the rest
+// of the scoring prompt is — an upper-case label, a colon, the material — so
+// that an example reads as the same kind of thing the model is about to be
+// asked about.
+const (
+	examplesHeader = "EXAMPLES (worked answers for other states, as guidance; judge only the STATE below):"
+	examplePrefix  = "EXAMPLE "
+	exampleState   = " STATE:\n"
+	exampleAnswer  = " ANSWER: "
+)
+
+// ExamplesBlock renders a question's worked examples as one labelled block: an
+// example's state, then the answer that was correct for it, in the terms that
+// question type answers in. A question that declares none renders the empty
+// string, so nothing downstream mentions examples at all.
+//
+// The answer line is phrased to echo the statement the model will be scoring —
+// "the correct option is", "the correct rating is level" — so that the example
+// and the candidate are visibly the same claim, one already settled and one
+// being asked about.
+//
+// The whole block is one string, and that is the point of it: a backend places
+// it in the part of the prompt that is the same for every candidate of the
+// question. Rendering an example as a prior exchange instead, ending in a
+// {"p": 0.95} answer, would have to name a candidate statement in it, and the
+// examples would then differ from call to call.
+//
+// An example's state is rendered the same way a request's own state is; the
+// error is that rendering's, for a state whose bytes are not JSON.
+func ExamplesBlock(q Question) (string, error) {
+	if len(q.Examples) == 0 {
+		return "", nil
+	}
+
+	var b strings.Builder
+	b.WriteString(examplesHeader)
+	for i, ex := range q.Examples {
+		text, err := ex.State.Text()
+		if err != nil {
+			return "", err
+		}
+		n := strconv.Itoa(i + 1)
+		b.WriteString("\n\n")
+		b.WriteString(examplePrefix)
+		b.WriteString(n)
+		b.WriteString(exampleState)
+		b.WriteString(text)
+		b.WriteString("\n")
+		b.WriteString(examplePrefix)
+		b.WriteString(n)
+		b.WriteString(exampleAnswer)
+		b.WriteString(exampleAnswerText(q, ex))
+	}
+	return b.String(), nil
+}
+
+// exampleAnswerText renders one example's answer in its question type's terms.
+//
+// A level index outside the declared scale loses its label rather than
+// panicking: [Validate] rejects one before any prompt is built, and a renderer
+// is the wrong place to discover it a second time.
+func exampleAnswerText(q Question, ex Example) string {
+	switch q.Type {
+	case TypeChoice:
+		return `the correct option is "` + ex.Choice + `".`
+	case TypeScore:
+		out := "the correct rating is level " + strconv.Itoa(ex.Level)
+		if ex.Level >= 0 && ex.Level < len(q.Levels) {
+			out += `: "` + q.Levels[ex.Level] + `"`
+		}
+		return out + "."
+	default:
+		if ex.Noul {
+			return "the proposition is true."
+		}
+		return "the proposition is false."
+	}
+}
+
 // statements returns every statement a question needs scored, in the order the
 // candidates were declared: one per option key for a choice, one per level for
 // a score, and exactly one for a noul.

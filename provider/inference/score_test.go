@@ -15,13 +15,20 @@ import (
 	"github.com/titusai-io/perceptea/internal/config"
 )
 
-// wantSystemPrompt is the system turn written out independently of the
-// constant the client uses, so that an edit to one is caught by the other.
-const wantSystemPrompt = `You are a calibrated probability estimator. Given a STATE and a STATEMENT, return only how likely the statement is true based solely on the state. Do not invent facts. Respond with JSON: {"p": <number 0 to 1>}.`
+// wantInstruction is the estimator instruction written out independently of
+// the constant the client uses, so that an edit to one is caught by the other.
+const wantInstruction = `You are a calibrated probability estimator. Given a STATE and a STATEMENT, return only how likely the statement is true based solely on the state. Do not invent facts. Respond with JSON: {"p": <number 0 to 1>}.`
 
-// wantUserPrompt is the user turn for the fixture state and statement. The
-// dash before the closing parenthesis is an en dash.
-const wantUserPrompt = "STATE:\nthe sky is grey\n\nSTATEMENT:\nIt is raining.\n\nHow likely is the statement true (0–1)?"
+// wantPrefix is the first message for the fixture request: the instruction and
+// the state, and — because the fixture question declares no examples — nothing
+// else. It carries nothing that identifies the candidate, which is what makes
+// it the same bytes for every candidate of a question.
+const wantPrefix = wantInstruction + "\n\nSTATE:\nthe sky is grey"
+
+// wantSuffix is the second message for the fixture statement: the one thing
+// that changes from candidate to candidate. The dash before the closing
+// parenthesis is an en dash.
+const wantSuffix = "STATEMENT:\nIt is raining.\n\nHow likely is the statement true (0–1)?"
 
 // fixtureRequest is the score request the prompt constants above describe.
 var fixtureRequest = classifier.ScoreRequest{
@@ -98,14 +105,14 @@ func TestScoreSendsTheExactLevelOneRequest(t *testing.T) {
 	if body.Messages[0].Role != "system" {
 		t.Errorf("messages[0].role = %q, want system", body.Messages[0].Role)
 	}
-	if body.Messages[0].Content != wantSystemPrompt {
-		t.Errorf("system prompt mismatch\n got: %q\nwant: %q", body.Messages[0].Content, wantSystemPrompt)
+	if body.Messages[0].Content != wantPrefix {
+		t.Errorf("prefix message mismatch\n got: %q\nwant: %q", body.Messages[0].Content, wantPrefix)
 	}
 	if body.Messages[1].Role != "user" {
 		t.Errorf("messages[1].role = %q, want user", body.Messages[1].Role)
 	}
-	if body.Messages[1].Content != wantUserPrompt {
-		t.Errorf("user prompt mismatch\n got: %q\nwant: %q", body.Messages[1].Content, wantUserPrompt)
+	if body.Messages[1].Content != wantSuffix {
+		t.Errorf("suffix message mismatch\n got: %q\nwant: %q", body.Messages[1].Content, wantSuffix)
 	}
 	if body.ResponseFormat.Type != "json_schema" {
 		t.Errorf("response_format.type = %q, want json_schema", body.ResponseFormat.Type)
@@ -127,6 +134,207 @@ func TestScoreSendsTheExactLevelOneRequest(t *testing.T) {
 	}
 	if !reflect.DeepEqual(schema, want) {
 		t.Errorf("schema mismatch\n got: %v\nwant: %v", schema, want)
+	}
+}
+
+// fixtureExamples stands in for the block the classifier renders for a
+// question that declares worked examples. Its wording is pinned where it is
+// built, in TestExamplesBlock; what these tests care about is where it lands.
+const fixtureExamples = "EXAMPLES (worked answers for other states, as guidance; judge only the STATE below):" +
+	"\n\nEXAMPLE 1 STATE:\nthe pump is stalled\nEXAMPLE 1 ANSWER: the correct option is \"technical\"."
+
+// TestThePrefixIsByteIdenticalForEveryCandidateOfAQuestion is the assertion
+// the two-message layout exists for. Every candidate answer of one question is
+// judged against the same instruction, the same worked examples and the same
+// state, and an endpoint only serves the repeats of that prompt prefix from
+// its cache while the bytes match exactly.
+//
+// Anything candidate-shaped in the prefix — an index, a count, a reordering —
+// defeats the caching silently. Every call still answers, every probability is
+// still right, and nothing says a word about it except the bill; so the bytes
+// are what is asserted, not the intent.
+func TestThePrefixIsByteIdenticalForEveryCandidateOfAQuestion(t *testing.T) {
+	const instructions = "Which team should handle this?"
+	// Real statements for real candidates of one question, so that whatever a
+	// candidate carries is genuinely present in the inputs and could leak.
+	statements := []string{
+		classifier.ChoiceStatement("department", instructions, "billing", "Charges, refunds, invoices"),
+		classifier.ChoiceStatement("department", instructions, "technical", "Bugs"),
+		classifier.ChoiceStatement("department", instructions, "sales", "Pricing and plans"),
+		classifier.ChoiceStatement("department", instructions, "other", ""),
+	}
+	// Two candidates that rendered the same statement would make every
+	// assertion below true for the wrong reason: the prefixes would match
+	// because the calls were identical, not because the layout keeps them so.
+	for i := range statements {
+		for j := i + 1; j < len(statements); j++ {
+			if statements[i] == statements[j] {
+				t.Fatalf("candidates %d and %d render the same statement %q; "+
+					"this fixture cannot see a candidate leaking into the prefix", i, j, statements[i])
+			}
+		}
+	}
+
+	api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+	client, _ := newTestClient(t, api, nil)
+
+	for _, statement := range statements {
+		req := fixtureRequest
+		req.Statement = statement
+		req.Examples = fixtureExamples
+		if _, err := client.Score(context.Background(), req); err != nil {
+			t.Fatalf("Score(%q): %v", statement, err)
+		}
+	}
+	if api.count() != len(statements) {
+		t.Fatalf("made %d calls, want %d (one per candidate)", api.count(), len(statements))
+	}
+
+	first := api.messages(t, 0)
+	for i, statement := range statements {
+		msgs := api.messages(t, i)
+		if msgs[0].Content != first[0].Content {
+			t.Errorf("candidate %d sent a different prefix, so the wave has none to cache\n got: %q\nwant: %q",
+				i, msgs[0].Content, first[0].Content)
+		}
+		if strings.Contains(msgs[0].Content, statement) {
+			t.Errorf("candidate %d's statement is in the shared prefix: %q", i, msgs[0].Content)
+		}
+		if !strings.Contains(msgs[1].Content, statement) {
+			t.Errorf("candidate %d's statement is not in its suffix: %q", i, msgs[1].Content)
+		}
+		if i > 0 && msgs[1].Content == first[1].Content {
+			t.Errorf("candidate %d sent candidate 0's suffix; the candidate is not reaching the model", i)
+		}
+	}
+}
+
+// The state is paid for once per wave and the statement once per candidate, so
+// each has to be on its own side of the cut.
+func TestTheStateIsInThePrefixAndTheStatementInTheSuffix(t *testing.T) {
+	api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+	client, _ := newTestClient(t, api, nil)
+
+	if _, err := client.Score(context.Background(), fixtureRequest); err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+
+	msgs := api.messages(t, 0)
+	if !strings.Contains(msgs[0].Content, fixtureRequest.State) {
+		t.Errorf("the state is not in the prefix: %q", msgs[0].Content)
+	}
+	if strings.Contains(msgs[0].Content, fixtureRequest.Statement) {
+		t.Errorf("the statement is in the prefix, which every candidate shares: %q", msgs[0].Content)
+	}
+	if !strings.Contains(msgs[1].Content, fixtureRequest.Statement) {
+		t.Errorf("the statement is not in the suffix: %q", msgs[1].Content)
+	}
+	if strings.Contains(msgs[1].Content, fixtureRequest.State) {
+		t.Errorf("the state is in the per-candidate suffix, so every call re-sends it: %q", msgs[1].Content)
+	}
+}
+
+// Examples belong in the shared prefix, between the instruction and the state.
+// In the suffix they would be re-sent, and re-charged, once per candidate.
+func TestExamplesGoInThePrefixAndNowhereElse(t *testing.T) {
+	api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+	client, _ := newTestClient(t, api, nil)
+
+	req := fixtureRequest
+	req.Examples = fixtureExamples
+	if _, err := client.Score(context.Background(), req); err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+
+	msgs := api.messages(t, 0)
+	want := wantInstruction + "\n\n" + fixtureExamples + "\n\nSTATE:\nthe sky is grey"
+	if msgs[0].Content != want {
+		t.Errorf("prefix mismatch\n got: %q\nwant: %q", msgs[0].Content, want)
+	}
+	if strings.Contains(strings.ToUpper(msgs[1].Content), "EXAMPLE") {
+		t.Errorf("the examples reached the per-candidate suffix: %q", msgs[1].Content)
+	}
+}
+
+// Optional means optional. A question that declares no examples produces the
+// prompt it would have produced had they never existed, down to the byte.
+func TestAQuestionWithoutExamplesLeavesNoTraceOfThem(t *testing.T) {
+	for _, tc := range []struct{ name, examples string }{
+		{"none declared", ""},
+		{"a block that is only whitespace", "  \n  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := alwaysJSON(t, scoreBody(`{"p":0.5}`))
+			client, _ := newTestClient(t, api, nil)
+
+			req := fixtureRequest
+			req.Examples = tc.examples
+			if _, err := client.Score(context.Background(), req); err != nil {
+				t.Fatalf("Score: %v", err)
+			}
+
+			msgs := api.messages(t, 0)
+			if msgs[0].Content != wantPrefix {
+				t.Errorf("prefix mismatch\n got: %q\nwant: %q", msgs[0].Content, wantPrefix)
+			}
+			if msgs[1].Content != wantSuffix {
+				t.Errorf("suffix mismatch\n got: %q\nwant: %q", msgs[1].Content, wantSuffix)
+			}
+			for i, m := range msgs {
+				if strings.Contains(strings.ToUpper(m.Content), "EXAMPLE") {
+					t.Errorf("message %d mentions an example although the question declared none: %q", i, m.Content)
+				}
+			}
+		})
+	}
+}
+
+// The layout moved; the contract did not. However the prompt is cut up, the
+// model is still told to answer with {"p": <number 0 to 1>}, still held to it
+// by the schema, and the number still comes back.
+func TestTheProbabilityContractStillReachesTheModel(t *testing.T) {
+	api := alwaysJSON(t, scoreBody(`{"p":0.77}`))
+	client, _ := newTestClient(t, api, nil)
+
+	req := fixtureRequest
+	req.Examples = fixtureExamples
+	got, err := client.Score(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if math.Abs(got.Probability-0.77) > 1e-9 {
+		t.Errorf("probability = %v, want 0.77", got.Probability)
+	}
+
+	const contract = `Respond with JSON: {"p": <number 0 to 1>}.`
+	prompt := strings.Join([]string{api.messages(t, 0)[0].Content, api.messages(t, 0)[1].Content}, "\n")
+	if !strings.Contains(prompt, contract) {
+		t.Errorf("the prompt no longer asks for %s\nprompt: %q", contract, prompt)
+	}
+
+	var body struct {
+		ResponseFormat struct {
+			Type       string `json:"type"`
+			JSONSchema struct {
+				Schema struct {
+					Required   []string       `json:"required"`
+					Properties map[string]any `json:"properties"`
+				} `json:"schema"`
+			} `json:"json_schema"`
+		} `json:"response_format"`
+	}
+	if err := json.Unmarshal(api.request(t, 0).raw, &body); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if body.ResponseFormat.Type != "json_schema" {
+		t.Fatalf("response_format.type = %q, want json_schema", body.ResponseFormat.Type)
+	}
+	schema := body.ResponseFormat.JSONSchema.Schema
+	if len(schema.Required) != 1 || schema.Required[0] != "p" {
+		t.Errorf("schema requires %v, want exactly [p]", schema.Required)
+	}
+	if _, ok := schema.Properties["p"]; !ok {
+		t.Errorf("schema declares no \"p\" property: %v", schema.Properties)
 	}
 }
 

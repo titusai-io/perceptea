@@ -113,6 +113,25 @@ func (a *fakeAPI) request(t *testing.T, i int) capturedRequest {
 	return a.captured[i]
 }
 
+// messages decodes the prompt of the i-th captured request, so a test can
+// assert which side of the prefix/suffix cut something landed on. It insists
+// on the two-message layout: one message would mean the state and the
+// statement had been concatenated again, and the shared prefix lost with them.
+func (a *fakeAPI) messages(t *testing.T, i int) []chatMessage {
+	t.Helper()
+	var body struct {
+		Messages []chatMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(a.request(t, i).raw, &body); err != nil {
+		t.Fatalf("captured body %d is not JSON: %v", i, err)
+	}
+	if len(body.Messages) != 2 {
+		t.Fatalf("request %d carried %d messages, want 2: a shared prefix and a per-candidate suffix",
+			i, len(body.Messages))
+	}
+	return body.Messages
+}
+
 // writeJSON sends a canned response body.
 func writeJSON(w http.ResponseWriter, status int, document string) {
 	w.Header().Set("Content-Type", "application/json")

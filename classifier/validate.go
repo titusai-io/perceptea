@@ -45,8 +45,8 @@ type ValidationError struct {
 	// Question is the name of the offending question, empty when the problem
 	// is with the request as a whole.
 	Question string
-	// Field names the part of the question at fault: "name", "type" or
-	// "criteria".
+	// Field names the part of the question at fault: "name", "type",
+	// "criteria" or "examples".
 	Field string
 	// Message says what is wrong with it.
 	Message string
@@ -91,7 +91,18 @@ func Validate(qs Questions) error {
 	return nil
 }
 
+// validateQuestion checks one question's criteria and then its worked
+// examples, in that order: an example answers in the criteria's terms, so
+// there is nothing to check an example against until the criteria are known
+// to be sound.
 func validateQuestion(name string, q Question) error {
+	if err := validateCriteria(name, q); err != nil {
+		return err
+	}
+	return validateExamples(name, q)
+}
+
+func validateCriteria(name string, q Question) error {
 	switch q.Type {
 	case TypeChoice:
 		n := q.Options.Len()
@@ -163,4 +174,46 @@ func validateQuestion(name string, q Question) error {
 				q.Type, TypeChoice, TypeScore, TypeNoul),
 		}
 	}
+}
+
+// validateExamples checks that every worked example a question declares can
+// actually be shown: it is about some state, and its answer is one the
+// question could have given.
+//
+// An example that names an undeclared option, or a level off the end of the
+// scale, teaches the model an answer it is not allowed to reach — and an
+// example is paid for on every call of the wave, so a wrong one is wrong many
+// times over. It is caught here, before any call is made, rather than at
+// prompt-building time, where there is nowhere good to report it.
+func validateExamples(name string, q Question) error {
+	for i, ex := range q.Examples {
+		if ex.State.IsZero() {
+			return &ValidationError{
+				Question: name,
+				Field:    "examples",
+				Message:  fmt.Sprintf("example %d has no state", i),
+			}
+		}
+		switch q.Type {
+		case TypeChoice:
+			if _, ok := q.Options.Get(ex.Choice); !ok {
+				return &ValidationError{
+					Question: name,
+					Field:    "examples",
+					Message: fmt.Sprintf("example %d answers %q, which is not one of the declared option keys",
+						i, ex.Choice),
+				}
+			}
+		case TypeScore:
+			if ex.Level < 0 || ex.Level >= len(q.Levels) {
+				return &ValidationError{
+					Question: name,
+					Field:    "examples",
+					Message: fmt.Sprintf("example %d answers with level %d, outside the declared scale of %d levels (0 to %d)",
+						i, ex.Level, len(q.Levels), len(q.Levels)-1),
+				}
+			}
+		}
+	}
+	return nil
 }

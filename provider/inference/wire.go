@@ -13,11 +13,19 @@ import (
 // ReasoningEffort does carry omitempty, and that is the whole of its default
 // behaviour: an unconfigured client sends no reasoning field at all, so a
 // provider that has never seen one is asked exactly what it was asked before.
+//
+// Logprobs and TopLogprobs carry omitempty for the same reason and it matters
+// more here: only the logprob scorer asks for them, and a chat scoring call
+// has to go on the wire as the same bytes it did before they existed. A
+// provider that has never been sent logprobs must not start receiving
+// "logprobs":false.
 type chatRequest struct {
 	Model           string          `json:"model"`
 	Messages        []chatMessage   `json:"messages"`
 	Temperature     float64         `json:"temperature"`
 	MaxTokens       int             `json:"max_tokens,omitempty"`
+	Logprobs        bool            `json:"logprobs,omitempty"`
+	TopLogprobs     int             `json:"top_logprobs,omitempty"`
 	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
 }
@@ -53,9 +61,42 @@ type chatResponse struct {
 // FinishReason is why the provider stopped generating. "length" is the one
 // value this package acts on: it means the reply was cut off at the output
 // token limit rather than finished, and a cut-off reply is not an answer.
+//
+// Logprobs is the per-token distribution, and is present only when the
+// request asked for it. It is a pointer so that "the provider sent no
+// logprobs block at all" and "the provider sent an empty one" are the same
+// thing to read and neither is mistaken for a distribution.
 type chatChoice struct {
 	Message      chatResponseMessage `json:"message"`
 	FinishReason string              `json:"finish_reason"`
+	Logprobs     *choiceLogprobs     `json:"logprobs"`
+}
+
+// choiceLogprobs is the logprob block of one choice. Content holds one entry
+// per generated token, in order; under the logprob scorer's one-token cap
+// there is at most one.
+type choiceLogprobs struct {
+	Content []tokenLogprobs `json:"content"`
+}
+
+// tokenLogprobs is one generated token: the one the provider actually picked,
+// its logprob, and the most likely alternatives at that position.
+//
+// TopLogprobs is what the logprob scorer reads. The picked token is only a
+// sample from the distribution; the distribution is the estimate. It does
+// carry the fallback, though, for a provider that returns the picked token
+// and no alternatives at all.
+type tokenLogprobs struct {
+	Token       string       `json:"token"`
+	Logprob     float64      `json:"logprob"`
+	TopLogprobs []topLogprob `json:"top_logprobs"`
+}
+
+// topLogprob is one alternative token and its natural-log probability, which
+// is zero or negative.
+type topLogprob struct {
+	Token   string  `json:"token"`
+	Logprob float64 `json:"logprob"`
 }
 
 // chatResponseMessage is the assistant turn. The reasoning fields are

@@ -92,7 +92,22 @@ func (s *Server) classify(err error) failure {
 		return failure{
 			status:  http.StatusBadGateway,
 			code:    codeUpstreamError,
-			message: truncatedMessage(err),
+			message: withoutPackagePrefix(err),
+			detail:  err.Error(),
+		}
+
+	// The logprob scorer's two refusals belong with the truncation above,
+	// for the same reason: both are configuration faults that repeat on
+	// every candidate of every request, and both carry the fix in their own
+	// text. An endpoint that will not return logprobs will not return them
+	// for the next candidate either, and a model that answers a Yes-or-No
+	// question with neither word answers the next one the same way — which
+	// is exactly why neither is allowed to become a neutral score.
+	case errors.Is(err, inference.ErrNoLogprobs), errors.Is(err, inference.ErrNoDecisionToken):
+		return failure{
+			status:  http.StatusBadGateway,
+			code:    codeUpstreamError,
+			message: withoutPackagePrefix(err),
 			detail:  err.Error(),
 		}
 
@@ -132,6 +147,15 @@ func (s *Server) classify(err error) failure {
 			status:  http.StatusBadRequest,
 			code:    codeInvalidRequest,
 			message: "no questions to answer",
+		}
+	// The batch handler rejects an empty "items" before it gets this far, so
+	// this is the belt to that braces: were the check ever to move, an empty
+	// batch would still be the caller's 400 rather than the server's 500.
+	case errors.Is(err, classifier.ErrNoItems):
+		return failure{
+			status:  http.StatusBadRequest,
+			code:    codeInvalidRequest,
+			message: "no items to evaluate",
 		}
 	}
 
@@ -202,13 +226,12 @@ func (s *Server) classifyRead(err error) failure {
 	return failure{status: StatusClientClosedRequest, detail: detail}
 }
 
-// truncatedMessage renders a cut-off reply for the caller.
-//
-// Unlike every other upstream failure, the error's own text is already the
-// message worth sending: it names the limit, the cause and the two ways out.
-// Only the package prefix every error in this service carries for the log is
-// dropped, so what the caller reads starts with the finding.
-func truncatedMessage(err error) string {
+// withoutPackagePrefix strips the package name an error was tagged with, so
+// that a message written to be read by an operator reaches them as it was
+// written rather than as "inference: …". It is used for the faults whose own
+// text is the diagnosis and the fix — a truncated reply, an endpoint that
+// returns no logprobs, a model that will not answer the question.
+func withoutPackagePrefix(err error) string {
 	msg := err.Error()
 	for _, prefix := range []string{"inference: ", "classifier: "} {
 		if after, ok := strings.CutPrefix(msg, prefix); ok {
