@@ -1,0 +1,18 @@
+# Environment
+.env
+.env.local
+
+# Build output
+/bin/
+/dist/
+perceptea
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
