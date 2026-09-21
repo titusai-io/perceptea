@@ -4,7 +4,7 @@
 # any request. Everything below is a real, runnable example of the three
 # question types.
 #
-# Start the service first. DeepInfra and mistralai/Mistral-Small-24B-Instruct-2501
+# Start the service first. DeepInfra and Qwen/Qwen3.8-Flash
 # are already the defaults, so a key is the only thing it needs:
 #
 #     PERCEPTEA_API_KEY=<your DeepInfra key> go run ./cmd/perceptea
@@ -334,7 +334,7 @@ Content-Type: application/json
   "state": "Charged twice again!!",
   "inference_base_url": "https://api.deepinfra.com/v1/openai",
   "api_key": "{{$dotenv PERCEPTEA_API_KEY}}",
-  "model": "mistralai/Mistral-Small-24B-Instruct-2501",
+  "model": "Qwen/Qwen3.8-Flash",
   "questions": {
     "angry": { "type": "noul", "instructions": "The customer is angry" }
   }

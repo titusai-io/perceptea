@@ -35,7 +35,7 @@ func TestLoadFromDefaults(t *testing.T) {
 		Addr:                    ":8080",
 		BaseURL:                 "https://api.deepinfra.com/v1/openai",
 		APIKey:                  "",
-		Model:                   "mistralai/Mistral-Small-24B-Instruct-2501",
+		Model:                   "Qwen/Qwen3.8-Flash",
 		ReasoningEffort:         "",
 		Temperature:             0,
 		MaxConcurrency:          8,
@@ -56,7 +56,7 @@ func TestLoadFromDefaults(t *testing.T) {
 	if DefaultInferenceBaseURL != "https://api.deepinfra.com/v1/openai" {
 		t.Errorf("DefaultInferenceBaseURL = %q", DefaultInferenceBaseURL)
 	}
-	if DefaultModel != "mistralai/Mistral-Small-24B-Instruct-2501" {
+	if DefaultModel != "Qwen/Qwen3.8-Flash" {
 		t.Errorf("DefaultModel = %q", DefaultModel)
 	}
 }

@@ -45,7 +45,7 @@ const (
 	// scorer asks for first; and input tokens are what a fan-out of small
 	// calls is billed for, which is where it is cheapest. See the README's
 	// "Choosing a model".
-	DefaultModel = "mistralai/Mistral-Small-24B-Instruct-2501"
+	DefaultModel = "Qwen/Qwen3.8-Flash"
 	// DefaultTemperature is 0 because it is the only setting that makes a
 	// classification reproducible.
 	DefaultTemperature = 0.0
