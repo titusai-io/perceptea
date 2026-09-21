@@ -20,8 +20,10 @@ type evaluateRequest struct {
 	State     classifier.State     `json:"state"`
 	Questions classifier.Questions `json:"questions"`
 	Model     string               `json:"model"`
-	BaseURL   string               `json:"base_url"`
-	APIKey    string               `json:"api_key"`
+	// InferenceBaseURL is the API root this one request's scoring calls
+	// should go to, in place of the server's own.
+	InferenceBaseURL string `json:"inference_base_url"`
+	APIKey           string `json:"api_key"`
 	// Temperature is a pointer so that an explicit 0 is distinguishable from
 	// an absent field; 0 is a meaningful value here, and the usual one.
 	Temperature *float64 `json:"temperature"`
@@ -82,7 +84,7 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	scope.mode = clip(string(mode), maxLoggedValue)
 
 	apiKey, baseURL := s.cfg.APIKey, s.cfg.BaseURL
-	bodyKey, bodyBase := strings.TrimSpace(body.APIKey), strings.TrimSpace(body.BaseURL)
+	bodyKey, bodyBase := strings.TrimSpace(body.APIKey), strings.TrimSpace(body.InferenceBaseURL)
 	if s.cfg.AllowRequestCredentials {
 		if bodyKey != "" {
 			apiKey = bodyKey
@@ -95,12 +97,7 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 			// credential in it, and the request scope does not yet know to
 			// scrub one.
 			if err := config.ValidateBaseURL(bodyBase); err != nil {
-				s.writeError(w, r, http.StatusBadRequest, codeInvalidRequest, `"base_url" `+err.Error())
-				return
-			}
-			if !s.cfg.AllowsBaseURL(bodyBase) {
-				s.writeError(w, r, http.StatusBadRequest, codeInvalidRequest,
-					`"base_url" is not one of the endpoints this server is allowed to call; see `+config.EnvAllowedBaseURLs)
+				s.writeError(w, r, http.StatusBadRequest, codeInvalidRequest, `"inference_base_url" `+err.Error())
 				return
 			}
 			baseURL = bodyBase
@@ -110,7 +107,7 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 		// down server should still get its answers.
 		s.log.DebugContext(r.Context(), "ignoring request-supplied credentials",
 			slog.Bool("api_key", bodyKey != ""),
-			slog.Bool("base_url", bodyBase != ""))
+			slog.Bool("inference_base_url", bodyBase != ""))
 	}
 	scope.secret = apiKey
 	scope.baseURL = baseURL

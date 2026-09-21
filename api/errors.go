@@ -204,15 +204,11 @@ func upstreamMessage(e *openai.APIError) string {
 }
 
 // missingKeyMessage tells the caller where a key could come from, naming the
-// active provider's variable — never a key.
+// variable it is read from — never a key.
 func (s *Server) missingKeyMessage() string {
 	var b strings.Builder
 	b.WriteString("no API key: set ")
 	b.WriteString(config.EnvAPIKey)
-	if p, ok := config.Lookup(s.cfg.Provider); ok {
-		b.WriteString(" or ")
-		b.WriteString(p.EnvKey)
-	}
 	b.WriteString(" in the server's environment")
 	if s.cfg.AllowRequestCredentials {
 		b.WriteString(", or send \"api_key\" in the request body")

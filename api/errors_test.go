@@ -413,10 +413,16 @@ func TestEvaluateFactoryErrorsAreClassifiedToo(t *testing.T) {
 	h.factoryErr = openai.ErrNoAPIKey
 
 	message := h.expectError(h.post(validBody), http.StatusUnauthorized, codeMissingAPIKey)
-	for _, want := range []string{config.EnvAPIKey, "OPENAI_API_KEY", "api_key"} {
+	for _, want := range []string{config.EnvAPIKey, "api_key"} {
 		if !strings.Contains(message, want) {
 			t.Errorf("message = %q, want it to mention %q", message, want)
 		}
+	}
+	// Exactly one environment variable, because exactly one is read. A
+	// message that offered a second one would be sending the operator to set
+	// a variable this service never looks at.
+	if n := strings.Count(message, "_API_KEY"); n != 1 {
+		t.Errorf("message = %q, want it to name one key variable, named %d", message, n)
 	}
 	if len(h.seenRequests) != 0 {
 		t.Error("the server evaluated a request it had no key for")
@@ -546,7 +552,7 @@ func TestEvaluateRejectsAnOversizedBody(t *testing.T) {
 
 func TestEvaluateHonoursRequestCredentialsOnlyWhenAllowed(t *testing.T) {
 	const bodyKey = "sk-from-the-body-9876543210"
-	body := fmt.Sprintf(`{"state":"s","questions":{"q":{"type":"noul"}},"api_key":%q,"base_url":"https://body.example/v1"}`, bodyKey)
+	body := fmt.Sprintf(`{"state":"s","questions":{"q":{"type":"noul"}},"api_key":%q,"inference_base_url":"https://body.example/v1"}`, bodyKey)
 
 	t.Run("allowed", func(t *testing.T) {
 		h := newHarness(t, func(c *config.Config) { c.AllowRequestCredentials = true })
@@ -585,7 +591,7 @@ func TestEvaluateHonoursRequestCredentialsOnlyWhenAllowed(t *testing.T) {
 
 	t.Run("blank body credentials never win", func(t *testing.T) {
 		h := newHarness(t, nil)
-		blank := `{"state":"s","questions":{"q":{"type":"noul"}},"api_key":"   ","base_url":""}`
+		blank := `{"state":"s","questions":{"q":{"type":"noul"}},"api_key":"   ","inference_base_url":""}`
 		if w := h.post(blank); w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", w.Code)
 		}
@@ -652,7 +658,7 @@ func TestABaseURLCredentialIsScrubbedFromTheLog(t *testing.T) {
 		h := newHarness(t, nil)
 		h.failWith(errors.New(`openai: chat completion: Post "https://theirs.example/v1?token=zzz-secret-999/chat/completions": dial tcp: connection refused`))
 
-		h.post(`{"state":"s","questions":{"q":{"type":"noul"}},"base_url":"https://theirs.example/v1?token=zzz-secret-999"}`)
+		h.post(`{"state":"s","questions":{"q":{"type":"noul"}},"inference_base_url":"https://theirs.example/v1?token=zzz-secret-999"}`)
 
 		if logs := h.logs.String(); strings.Contains(logs, "token=zzz-secret-999") {
 			t.Errorf("the log contains the caller's own gateway credential:\n%s", logs)

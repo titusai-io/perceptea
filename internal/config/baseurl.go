@@ -30,8 +30,8 @@ func ValidateBaseURL(raw string) error {
 
 // DisplayBaseURL renders a base URL for a response body or a log line.
 //
-// Operators are invited to point PERCEPTEA_BASE_URL at a proxy or a gateway,
-// and a gateway URL routinely carries the credential: in the userinfo
+// Operators are invited to point PERCEPTEA_INFERENCE_BASE_URL at a proxy or a
+// gateway, and a gateway URL routinely carries the credential: in the userinfo
 // (https://svc:sk-secret@gateway/v1) or in the query (?key=...). Neither is
 // anybody else's business, so both are dropped, along with the fragment, and
 // what is left still says where calls are going.
@@ -88,55 +88,6 @@ func CredentialsIn(raw string) []string {
 	}
 	if u.RawQuery != "" {
 		out = append(out, u.RawQuery)
-	}
-	return out
-}
-
-// AllowsBaseURL reports whether a base URL supplied in a request body is one
-// this server will call. An empty AllowedBaseURLs allows everything, which is
-// the default: the service is meant to be pointed at a local model server as
-// easily as at a hosted one.
-//
-// A prefix match is a blunt instrument. A prefix that stops inside a host also
-// matches a longer host — "https://api.example" matches
-// "https://api.example.attacker.test" — so a prefix should end at a host
-// boundary or a path separator. The comparison lower-cases the scheme and the
-// host, which are case-insensitive in a URL, so that casing cannot be used to
-// slip past a prefix.
-func (c Config) AllowsBaseURL(raw string) bool {
-	if len(c.AllowedBaseURLs) == 0 {
-		return true
-	}
-	target := foldBaseURL(raw)
-	for _, allowed := range c.AllowedBaseURLs {
-		if strings.HasPrefix(target, foldBaseURL(allowed)) {
-			return true
-		}
-	}
-	return false
-}
-
-// foldBaseURL lower-cases the case-insensitive halves of a URL: its scheme and
-// its host. The path is left alone, because a path is case-sensitive.
-func foldBaseURL(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	u, err := url.Parse(trimmed)
-	if err != nil {
-		return trimmed
-	}
-	u.Scheme = strings.ToLower(u.Scheme)
-	u.Host = strings.ToLower(u.Host)
-	return u.String()
-}
-
-// parseAllowedBaseURLs splits the comma-separated PERCEPTEA_ALLOWED_BASE_URLS
-// into prefixes, dropping empty entries so that a trailing comma is harmless.
-func parseAllowedBaseURLs(raw string) []string {
-	var out []string
-	for field := range strings.SplitSeq(raw, ",") {
-		if trimmed := strings.TrimSpace(field); trimmed != "" {
-			out = append(out, trimmed)
-		}
 	}
 	return out
 }

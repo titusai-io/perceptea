@@ -34,7 +34,9 @@ type Settings struct {
 	// APIKey is the resolved provider key. It may be empty, in which case
 	// building the evaluator is expected to fail with openai.ErrNoAPIKey.
 	APIKey string
-	// BaseURL is the resolved OpenAI-compatible API root.
+	// BaseURL is the resolved inference API root: the root of the service
+	// that runs the model, which the client turns into
+	// <BaseURL>/chat/completions.
 	BaseURL string
 	// Model is the resolved model id.
 	Model string
@@ -75,9 +77,6 @@ func NewServer(opts Options) (*Server, error) {
 	if cfg.MaxBodyBytes < 1 {
 		cfg.MaxBodyBytes = config.DefaultMaxBodyBytes
 	}
-	if cfg.Provider == "" {
-		cfg.Provider = config.DefaultProvider
-	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -104,8 +103,6 @@ func NewServer(opts Options) (*Server, error) {
 	mux.HandleFunc("/api/evaluate", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("/api/health", s.methodNotAllowed(http.MethodGet))
-	mux.HandleFunc("GET /api/providers", s.handleProviders)
-	mux.HandleFunc("/api/providers", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/", s.handleNotFound)
 	s.handler = s.withRequestScope(mux)
 

@@ -55,10 +55,9 @@ func newHarness(t *testing.T, tweak func(*config.Config)) *harness {
 
 	cfg := config.Config{
 		Addr:                    ":0",
-		Provider:                "openai",
 		BaseURL:                 "https://api.openai.com/v1",
 		APIKey:                  testKey,
-		Model:                   "gpt-4o-mini",
+		Model:                   "probe-1",
 		Temperature:             0,
 		MaxConcurrency:          8,
 		RequestTimeout:          5 * time.Second,
@@ -192,7 +191,9 @@ func (h *harness) expectError(w *httptest.ResponseRecorder, status int, code str
 // ptr is a pointer to a value, for the nullable usage counters.
 func ptr[T any](v T) *T { return &v }
 
-// sampleBody is the worked example from the README.
+// sampleBody is the worked example from the README, with a neutral model id:
+// no test in this package cares which model it names, and one that borrowed
+// the real default would have to be edited every time the default moved.
 const sampleBody = `{
   "state": "Charged twice again!! Second month in a row.",
   "mode": "parallel",
@@ -216,7 +217,7 @@ const sampleBody = `{
       "instructions": "Strong frustration or anger?"
     }
   },
-  "model": "gpt-4o-mini"
+  "model": "probe-1"
 }`
 
 // sampleResponse is the answer the README documents for it.
@@ -251,7 +252,7 @@ func sampleResponse() classifier.Response {
 	answers.Set("angry", classifier.Answer{Type: classifier.TypeNoul, Noul: 0.88})
 
 	return classifier.Response{
-		Model:   "gpt-4o-mini",
+		Model:   "probe-1",
 		Answers: *answers,
 		Usage:   classifier.Usage{InputTokens: ptr(1840), OutputTokens: ptr(96)},
 		Meta:    &classifier.Meta{Mode: classifier.ModeParallel, LatencyMS: 620, ParallelCalls: 9},
@@ -271,7 +272,7 @@ func TestEvaluateHappyPath(t *testing.T) {
 		t.Errorf("Content-Type = %q", ct)
 	}
 
-	const want = `{"model":"gpt-4o-mini",` +
+	const want = `{"model":"probe-1",` +
 		`"answers":{` +
 		`"department":{"type":"choice","choice":"billing","confidence":0.82,` +
 		`"probabilities":{"billing":0.71,"technical":0.12,"other":0.17}},` +
@@ -308,7 +309,7 @@ func TestEvaluatePassesTheRequestThrough(t *testing.T) {
 	if got := req.Questions.Keys(); !slicesEqual(got, []string{"department", "urgency", "angry"}) {
 		t.Errorf("question order = %v, want the document order", got)
 	}
-	if req.Model != "gpt-4o-mini" {
+	if req.Model != "probe-1" {
 		t.Errorf("model = %q", req.Model)
 	}
 	if req.Mode != classifier.ModeParallel {
@@ -417,13 +418,22 @@ func TestEvaluateRejectsAWrongMethod(t *testing.T) {
 	}
 }
 
+// Two paths are served, /api/evaluate and /api/health. Every other path,
+// whatever the method, falls through to the catch-all and answers in the same
+// JSON shape as every other failure rather than in the mux's own prose.
 func TestUnknownPathIs404(t *testing.T) {
 	h := newHarness(t, nil)
-	for _, path := range []string{"/api/nope", "/", "/api/evaluate/extra"} {
-		w := h.get(path)
-		h.expectError(w, http.StatusNotFound, "not_found")
-		if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
-			t.Errorf("GET %s: Content-Type = %q, want JSON like every other failure", path, ct)
+	// "/api/providers" is in this list deliberately. It was a real route once,
+	// listing the endpoint presets that configuration no longer has, and a
+	// route that used to exist is the one an editor is most likely to restore
+	// by reflex. It must 404 like any other unknown path.
+	for _, path := range []string{"/api/nope", "/", "/api/evaluate/extra", "/api/meta", "/api/models", "/api/providers"} {
+		for _, method := range []string{http.MethodGet, http.MethodPost} {
+			w := h.send(httptest.NewRequest(method, path, strings.NewReader("")))
+			h.expectError(w, http.StatusNotFound, "not_found")
+			if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+				t.Errorf("%s %s: Content-Type = %q, want JSON like every other failure", method, path, ct)
+			}
 		}
 	}
 }

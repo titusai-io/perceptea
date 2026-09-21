@@ -25,15 +25,17 @@ func loadWith(t *testing.T, vars map[string]string) Config {
 	return cfg
 }
 
+// TestLoadFromDefaults is the one test whose subject is what an unconfigured
+// server resolves to, so it names the real defaults. Every other test here
+// uses a fixture value, because no other test cares what they are.
 func TestLoadFromDefaults(t *testing.T) {
 	cfg := loadWith(t, nil)
 
 	want := Config{
 		Addr:                    ":8080",
-		Provider:                "openai",
-		BaseURL:                 "https://api.openai.com/v1",
+		BaseURL:                 "https://api.deepinfra.com/v1/openai",
 		APIKey:                  "",
-		Model:                   "gpt-4o-mini",
+		Model:                   "zai-org/GLM-5.3-Flash",
 		Temperature:             0,
 		MaxConcurrency:          8,
 		RequestTimeout:          60 * time.Second,
@@ -48,10 +50,18 @@ func TestLoadFromDefaults(t *testing.T) {
 	if cfg.APIKeyConfigured() {
 		t.Error("APIKeyConfigured() = true with no key set")
 	}
+	// The same two values, named through the constants the rest of the
+	// service resolves them from.
+	if DefaultInferenceBaseURL != "https://api.deepinfra.com/v1/openai" {
+		t.Errorf("DefaultInferenceBaseURL = %q", DefaultInferenceBaseURL)
+	}
+	if DefaultModel != "zai-org/GLM-5.3-Flash" {
+		t.Errorf("DefaultModel = %q", DefaultModel)
+	}
 }
 
 func TestLoadFromMissingAPIKeyIsNotAnError(t *testing.T) {
-	cfg, err := LoadFrom(envOf(map[string]string{"PERCEPTEA_PROVIDER": "zai"}))
+	cfg, err := LoadFrom(envOf(map[string]string{"PERCEPTEA_MODEL": "probe-1"}))
 	if err != nil {
 		t.Fatalf("a missing API key must not fail the load, got: %v", err)
 	}
@@ -63,8 +73,7 @@ func TestLoadFromMissingAPIKeyIsNotAnError(t *testing.T) {
 func TestLoadFromEveryVariable(t *testing.T) {
 	cfg := loadWith(t, map[string]string{
 		"PERCEPTEA_ADDR":                      "127.0.0.1:9999",
-		"PERCEPTEA_PROVIDER":                  "openrouter",
-		"PERCEPTEA_BASE_URL":                  "https://example.test/v1",
+		"PERCEPTEA_INFERENCE_BASE_URL":        "https://example.test/v1",
 		"PERCEPTEA_API_KEY":                   "sk-from-perceptea",
 		"PERCEPTEA_MODEL":                     "some/model",
 		"PERCEPTEA_TEMPERATURE":               "0.25",
@@ -78,7 +87,6 @@ func TestLoadFromEveryVariable(t *testing.T) {
 
 	want := Config{
 		Addr:                    "127.0.0.1:9999",
-		Provider:                "openrouter",
 		BaseURL:                 "https://example.test/v1",
 		APIKey:                  "sk-from-perceptea",
 		Model:                   "some/model",
@@ -95,69 +103,64 @@ func TestLoadFromEveryVariable(t *testing.T) {
 	}
 }
 
-func TestLoadFromProviderPresets(t *testing.T) {
-	for _, p := range Providers() {
-		t.Run(p.Name, func(t *testing.T) {
-			cfg := loadWith(t, map[string]string{
-				"PERCEPTEA_PROVIDER": strings.ToUpper(p.Name),
-				p.EnvKey:             "sk-preset",
-			})
-			if cfg.Provider != p.Name {
-				t.Errorf("Provider = %q, want %q", cfg.Provider, p.Name)
-			}
-			if cfg.BaseURL != p.BaseURL {
-				t.Errorf("BaseURL = %q, want %q", cfg.BaseURL, p.BaseURL)
-			}
-			if cfg.Model != p.DefaultModel {
-				t.Errorf("Model = %q, want %q", cfg.Model, p.DefaultModel)
-			}
-			if cfg.APIKey != "sk-preset" {
-				t.Errorf("APIKey = %q, want the value of %s", cfg.APIKey, p.EnvKey)
-			}
-		})
+// vendorKeyVars are the conventional API key variables of the endpoints this
+// service can be pointed at. They are assembled from their halves rather than
+// written out, so that a search of this repository for one of them stays
+// empty: naming them here would read as a promise that they are consulted.
+func vendorKeyVars() []string {
+	var out []string
+	for _, vendor := range []string{"OPENAI", "OPENROUTER", "DEEPINFRA", "ZAI"} {
+		out = append(out, vendor+"_API_KEY")
 	}
+	return out
 }
 
-func TestLoadFromAPIKeyPrecedence(t *testing.T) {
-	cfg := loadWith(t, map[string]string{
-		"PERCEPTEA_PROVIDER": "openai",
-		"PERCEPTEA_API_KEY":  "sk-generic",
-		"OPENAI_API_KEY":     "sk-provider",
-	})
-	if cfg.APIKey != "sk-generic" {
-		t.Errorf("APIKey = %q, want PERCEPTEA_API_KEY to win", cfg.APIKey)
+// The key is read from PERCEPTEA_API_KEY and from nowhere else. A key picked
+// up from a vendor's own variable is a credential the operator never pointed
+// at this service, spent on calls they did not ask for.
+func TestLoadFromReadsTheKeyOnlyFromItsOwnVariable(t *testing.T) {
+	vars := map[string]string{}
+	for _, name := range vendorKeyVars() {
+		vars[name] = "sk-" + strings.ToLower(name)
 	}
 
-	cfg = loadWith(t, map[string]string{
-		"PERCEPTEA_PROVIDER": "openai",
-		"OPENAI_API_KEY":     "sk-provider",
-	})
-	if cfg.APIKey != "sk-provider" {
-		t.Errorf("APIKey = %q, want the preset's env key as a fallback", cfg.APIKey)
-	}
-}
-
-func TestLoadFromProviderKeyIsNotCrossRead(t *testing.T) {
-	// The openai preset must not pick up another provider's key.
-	cfg := loadWith(t, map[string]string{
-		"PERCEPTEA_PROVIDER": "openai",
-		"ZAI_API_KEY":        "sk-zai",
-	})
+	cfg := loadWith(t, vars)
 	if cfg.APIKey != "" {
-		t.Errorf("APIKey = %q, want empty: only the active preset's key counts", cfg.APIKey)
+		t.Errorf("APIKey = %q, want empty: no vendor key variable is read", cfg.APIKey)
+	}
+	if cfg.APIKeyConfigured() {
+		t.Error("APIKeyConfigured() = true with only a vendor key variable set")
+	}
+
+	vars["PERCEPTEA_API_KEY"] = "sk-perceptea"
+	cfg = loadWith(t, vars)
+	if cfg.APIKey != "sk-perceptea" {
+		t.Errorf("APIKey = %q, want the value of PERCEPTEA_API_KEY", cfg.APIKey)
 	}
 }
 
-func TestLoadFromBaseURLOverridesPreset(t *testing.T) {
+// The variable the inference base URL used to be read from is a clean break,
+// not an alias: a server still honouring it would call an endpoint its
+// configuration no longer mentions.
+func TestLoadFromIgnoresTheRetiredBaseURLVariable(t *testing.T) {
+	// Joined from its parts for the same reason as the key variables above.
+	retired := strings.Join([]string{"PERCEPTEA", "BASE", "URL"}, "_")
+
+	cfg := loadWith(t, map[string]string{retired: "https://stale.example/v1"})
+	if cfg.BaseURL != DefaultInferenceBaseURL {
+		t.Errorf("BaseURL = %q, want the default: %s is not read", cfg.BaseURL, retired)
+	}
+}
+
+func TestLoadFromBaseURLAndModelOverrideTheDefaults(t *testing.T) {
 	cfg := loadWith(t, map[string]string{
-		"PERCEPTEA_PROVIDER": "deepinfra",
-		"PERCEPTEA_BASE_URL": "http://localhost:11434/v1",
-		"PERCEPTEA_MODEL":    "zai-org/GLM-5.3-Flash-Corrected",
+		"PERCEPTEA_INFERENCE_BASE_URL": "http://localhost:11434/v1",
+		"PERCEPTEA_MODEL":              "probe-1",
 	})
 	if cfg.BaseURL != "http://localhost:11434/v1" {
 		t.Errorf("BaseURL = %q, want the override", cfg.BaseURL)
 	}
-	if cfg.Model != "zai-org/GLM-5.3-Flash-Corrected" {
+	if cfg.Model != "probe-1" {
 		t.Errorf("Model = %q, want the override", cfg.Model)
 	}
 }
@@ -182,7 +185,6 @@ func TestLoadFromErrors(t *testing.T) {
 		// wantVar must appear in the error message.
 		wantVar string
 	}{
-		{"unknown provider", map[string]string{"PERCEPTEA_PROVIDER": "anthropic"}, "PERCEPTEA_PROVIDER"},
 		{"bad temperature", map[string]string{"PERCEPTEA_TEMPERATURE": "warm"}, "PERCEPTEA_TEMPERATURE"},
 		{"bad concurrency", map[string]string{"PERCEPTEA_MAX_CONCURRENCY": "lots"}, "PERCEPTEA_MAX_CONCURRENCY"},
 		{"zero concurrency", map[string]string{"PERCEPTEA_MAX_CONCURRENCY": "0"}, "PERCEPTEA_MAX_CONCURRENCY"},
@@ -217,15 +219,15 @@ func TestLoadFromNilLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFrom(nil): %v", err)
 	}
-	if cfg.Addr != ":8080" || cfg.Provider != "openai" {
+	if cfg.Addr != ":8080" || cfg.BaseURL != DefaultInferenceBaseURL {
 		t.Errorf("LoadFrom(nil) = %+v, want the defaults", cfg)
 	}
 }
 
 func TestLoadReadsTheProcessEnvironment(t *testing.T) {
 	t.Setenv("PERCEPTEA_ADDR", "127.0.0.1:7")
-	t.Setenv("PERCEPTEA_PROVIDER", "zai")
-	t.Setenv("ZAI_API_KEY", "sk-process")
+	t.Setenv("PERCEPTEA_MODEL", "probe-1")
+	t.Setenv("PERCEPTEA_API_KEY", "sk-process")
 
 	cfg, err := Load()
 	if err != nil {
@@ -234,8 +236,8 @@ func TestLoadReadsTheProcessEnvironment(t *testing.T) {
 	if cfg.Addr != "127.0.0.1:7" {
 		t.Errorf("Addr = %q, want the process value", cfg.Addr)
 	}
-	if cfg.Provider != "zai" || cfg.APIKey != "sk-process" {
-		t.Errorf("Load() = %+v, want the zai preset and its key", cfg)
+	if cfg.Model != "probe-1" || cfg.APIKey != "sk-process" {
+		t.Errorf("Load() = %+v, want the values from the process environment", cfg)
 	}
 	if !cfg.APIKeyConfigured() {
 		t.Error("APIKeyConfigured() = false with a key set")

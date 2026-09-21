@@ -21,12 +21,15 @@ func TestEvaluateRejectsAnUnusableRequestBaseURL(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, nil)
-			body := strings.Replace(sampleBody, `"state"`,
-				`"base_url": `+quote(tc.baseURL)+`, "state"`, 1)
-			w := h.post(body)
+			w := h.post(withBaseURL(tc.baseURL))
 			msg := h.expectError(w, 400, "invalid_request")
 			if !strings.Contains(msg, tc.wantIn) {
 				t.Errorf("message %q does not mention %q", msg, tc.wantIn)
+			}
+			// The message names the field the caller sent, under the name
+			// they sent it under.
+			if !strings.Contains(msg, "inference_base_url") {
+				t.Errorf("message %q does not name the field at fault", msg)
 			}
 			if n := len(h.seenSettings); n != 0 {
 				t.Errorf("built %d evaluators, want 0: the request never should have reached the provider", n)
@@ -37,9 +40,7 @@ func TestEvaluateRejectsAnUnusableRequestBaseURL(t *testing.T) {
 
 func TestEvaluateAcceptsAUsableRequestBaseURL(t *testing.T) {
 	h := newHarness(t, nil)
-	body := strings.Replace(sampleBody, `"state"`,
-		`"base_url": "https://openrouter.ai/api/v1", "state"`, 1)
-	if w := h.post(body); w.Code != 200 {
+	if w := h.post(withBaseURL("https://openrouter.ai/api/v1")); w.Code != 200 {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
 	}
 	if got := h.settings().BaseURL; got != "https://openrouter.ai/api/v1" {
@@ -47,12 +48,29 @@ func TestEvaluateAcceptsAUsableRequestBaseURL(t *testing.T) {
 	}
 }
 
+// The retired spelling of the field is not an alias. It is an unknown field,
+// and an unknown field is a 400 naming it — the same rule that stops
+// "apikey" from silently spending the server's own credential.
+func TestEvaluateRejectsTheRetiredBaseURLField(t *testing.T) {
+	h := newHarness(t, nil)
+	retired := "base" + "_url"
+	body := strings.Replace(sampleBody, `"state"`,
+		`"`+retired+`": "https://openrouter.ai/api/v1", "state"`, 1)
+
+	msg := h.expectError(h.post(body), 400, codeInvalidJSON)
+	if !strings.Contains(msg, retired) {
+		t.Errorf("message = %q, want it to name the field it did not understand", msg)
+	}
+	if n := len(h.seenSettings); n != 0 {
+		t.Errorf("built %d evaluators, want 0", n)
+	}
+}
+
 // With request credentials disabled the body's base URL is ignored entirely,
 // so even an unusable one must not turn into an error.
 func TestEvaluateIgnoresABadBaseURLWhenCredentialsAreLocked(t *testing.T) {
 	h := newHarness(t, func(c *config.Config) { c.AllowRequestCredentials = false })
-	body := strings.Replace(sampleBody, `"state"`, `"base_url": "not a url", "state"`, 1)
-	if w := h.post(body); w.Code != 200 {
+	if w := h.post(withBaseURL("not a url")); w.Code != 200 {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
 	}
 	if got := h.settings().BaseURL; got != "https://api.openai.com/v1" {
@@ -60,74 +78,46 @@ func TestEvaluateIgnoresABadBaseURLWhenCredentialsAreLocked(t *testing.T) {
 	}
 }
 
-// With PERCEPTEA_ALLOWED_BASE_URLS set, a base URL in the request body must
-// be one of them: the service will otherwise call any host it can reach, on
-// behalf of anyone who can reach it.
-func TestEvaluateEnforcesTheAllowedBaseURLs(t *testing.T) {
-	allowed := []string{"https://api.openai.com/v1", "http://127.0.0.1:11434/v1"}
-
-	for _, tc := range []struct {
-		name    string
-		baseURL string
-		want    int
-	}{
-		{"an allowed prefix", "https://api.openai.com/v1", 200},
-		{"a longer path under an allowed prefix", "https://api.openai.com/v1/beta", 200},
-		{"the local model server", "http://127.0.0.1:11434/v1", 200},
-		{"a host that is not listed", "https://evil.example/v1", 400},
-		{"another port on an allowed host", "https://api.openai.com:8443/v1", 400},
-		{"a scheme downgrade", "http://api.openai.com/v1", 400},
-		{"casing does not help", "HTTPS://EVIL.example/v1", 400},
-		{"an allowed host in different casing", "HTTPS://API.OpenAI.com/v1", 200},
+// There is no endpoint allowlist: with request credentials on, any usable
+// base URL the caller names is called, and the only way to stop that is
+// PERCEPTEA_ALLOW_REQUEST_CREDENTIALS=false. A half-measure that let some
+// hosts through would be a filter to maintain and a false sense of safety.
+func TestEvaluateCallsAnyUsableBaseURLTheCallerNames(t *testing.T) {
+	for _, baseURL := range []string{
+		"https://anywhere.example/v1",
+		"http://192.168.1.50:8000/v1",
+		"http://127.0.0.1:11434/v1",
+		"https://api.openai.com:8443/v1",
+		"HTTPS://Mixed.Case.example/v1",
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t, func(c *config.Config) { c.AllowedBaseURLs = allowed })
-			body := strings.Replace(sampleBody, `"state"`, `"base_url": `+quote(tc.baseURL)+`, "state"`, 1)
-
-			w := h.post(body)
-
-			if tc.want == 200 {
-				if w.Code != 200 {
-					t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
-				}
-				return
+		t.Run(baseURL, func(t *testing.T) {
+			h := newHarness(t, nil)
+			if w := h.post(withBaseURL(baseURL)); w.Code != 200 {
+				t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
 			}
-			msg := h.expectError(w, 400, "invalid_request")
-			if strings.Contains(msg, tc.baseURL) {
-				t.Errorf("the message repeats the caller's base URL: %q", msg)
-			}
-			if !strings.Contains(msg, config.EnvAllowedBaseURLs) {
-				t.Errorf("message = %q, want it to name the setting at fault", msg)
-			}
-			if n := len(h.seenSettings); n != 0 {
-				t.Errorf("built %d evaluators, want 0: the call was made anyway", n)
+			if got := h.settings().BaseURL; got != baseURL {
+				t.Errorf("BaseURL = %q, want %q", got, baseURL)
 			}
 		})
 	}
 }
 
-// The default is no restriction: pointing this at a local model server is a
-// real use case, and an empty list must not quietly become an empty allowlist.
-func TestAnEmptyAllowListAllowsEverything(t *testing.T) {
-	h := newHarness(t, nil)
-	body := strings.Replace(sampleBody, `"state"`, `"base_url": "http://192.168.1.50:8000/v1", "state"`, 1)
-	if w := h.post(body); w.Code != 200 {
-		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
-	}
-}
-
-// The list bounds what a caller may name, not what the operator configured.
-func TestTheAllowListDoesNotApplyToTheServersOwnBaseURL(t *testing.T) {
-	h := newHarness(t, func(c *config.Config) {
-		c.BaseURL = "https://configured.example/v1"
-		c.AllowedBaseURLs = []string{"https://api.openai.com/v1"}
-	})
+// What a caller may name is one question; what the operator configured is
+// another, and the server's own endpoint is never second-guessed.
+func TestTheServersOwnBaseURLIsUsedWhenTheBodyNamesNone(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.BaseURL = "https://configured.example/v1" })
 	if w := h.post(sampleBody); w.Code != 200 {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
 	}
 	if got := h.settings().BaseURL; got != "https://configured.example/v1" {
 		t.Errorf("BaseURL = %q, want the configured one", got)
 	}
+}
+
+// withBaseURL puts an inference base URL into the sample request body.
+func withBaseURL(baseURL string) string {
+	return strings.Replace(sampleBody, `"state"`,
+		`"inference_base_url": `+quote(baseURL)+`, "state"`, 1)
 }
 
 func quote(s string) string {

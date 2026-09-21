@@ -1,3 +1,8 @@
+// Package config resolves the Perceptea server's settings from the process
+// environment.
+//
+// Nothing here reaches the network, and nothing here reads a file except
+// [LoadDotEnv], which is a best-effort convenience for local development.
 package config
 
 import (
@@ -12,8 +17,7 @@ import (
 // The environment variables Perceptea reads. Every one of them is optional.
 const (
 	EnvAddr                    = "PERCEPTEA_ADDR"
-	EnvProvider                = "PERCEPTEA_PROVIDER"
-	EnvBaseURL                 = "PERCEPTEA_BASE_URL"
+	EnvInferenceBaseURL        = "PERCEPTEA_INFERENCE_BASE_URL"
 	EnvAPIKey                  = "PERCEPTEA_API_KEY"
 	EnvModel                   = "PERCEPTEA_MODEL"
 	EnvTemperature             = "PERCEPTEA_TEMPERATURE"
@@ -21,7 +25,6 @@ const (
 	EnvRequestTimeout          = "PERCEPTEA_REQUEST_TIMEOUT"
 	EnvMaxBodyBytes            = "PERCEPTEA_MAX_BODY_BYTES"
 	EnvAllowRequestCredentials = "PERCEPTEA_ALLOW_REQUEST_CREDENTIALS"
-	EnvAllowedBaseURLs         = "PERCEPTEA_ALLOWED_BASE_URLS"
 	EnvLogLevel                = "PERCEPTEA_LOG_LEVEL"
 	EnvLogFormat               = "PERCEPTEA_LOG_FORMAT"
 )
@@ -29,8 +32,13 @@ const (
 // Defaults applied when a variable is unset or empty.
 const (
 	DefaultAddr = ":8080"
-	// DefaultProvider is the preset used when PERCEPTEA_PROVIDER is unset.
-	DefaultProvider = "openai"
+	// DefaultInferenceBaseURL is the API root the scoring calls go to when
+	// PERCEPTEA_INFERENCE_BASE_URL is unset. It is an API root, not an
+	// endpoint: the client appends /chat/completions to it.
+	DefaultInferenceBaseURL = "https://api.deepinfra.com/v1/openai"
+	// DefaultModel is the model scored when neither PERCEPTEA_MODEL nor the
+	// request body names one. It is a model the endpoint above publishes.
+	DefaultModel = "zai-org/GLM-5.3-Flash"
 	// DefaultTemperature is 0 because it is the only setting that makes a
 	// classification reproducible.
 	DefaultTemperature = 0.0
@@ -63,12 +71,13 @@ const (
 type Config struct {
 	// Addr is the listen address, as accepted by net.Listen.
 	Addr string
-	// Provider is the name of the resolved preset.
-	Provider string
-	// BaseURL is the OpenAI-compatible API root actually used.
+	// BaseURL is the inference API root the scoring calls actually go to: the
+	// root of the service that runs the model, which the client turns into
+	// <BaseURL>/chat/completions. PERCEPTEA_INFERENCE_BASE_URL sets it.
 	BaseURL string
-	// APIKey is the server's own key. It may be empty: the server still
-	// starts, and requests that cannot supply a key are rejected with 401.
+	// APIKey is the server's own key, from PERCEPTEA_API_KEY. It may be empty:
+	// the server still starts, and requests that cannot supply a key are
+	// rejected with 401.
 	APIKey string
 	// Model is the default model for requests that do not name one.
 	Model string
@@ -81,13 +90,9 @@ type Config struct {
 	// MaxBodyBytes bounds a request body.
 	MaxBodyBytes int64
 	// AllowRequestCredentials lets a request body override api_key and
-	// base_url. Exposing the service with this on makes it an open proxy.
+	// inference_base_url. Exposing the service with this on makes it an open
+	// proxy; turning it off is the whole answer, and there is no partial one.
 	AllowRequestCredentials bool
-	// AllowedBaseURLs bounds that open proxy: a base URL supplied in a
-	// request body must start with one of these prefixes. It is empty by
-	// default, which allows any of them. It never applies to the server's own
-	// BaseURL, which the operator chose.
-	AllowedBaseURLs []string
 	// LogLevel is the minimum level logged.
 	LogLevel slog.Level
 	// LogFormat is either LogFormatText or LogFormatJSON.
@@ -115,6 +120,8 @@ func LoadFrom(env func(string) string) (Config, error) {
 
 	cfg := Config{
 		Addr:                    DefaultAddr,
+		BaseURL:                 DefaultInferenceBaseURL,
+		Model:                   DefaultModel,
 		Temperature:             DefaultTemperature,
 		MaxConcurrency:          DefaultMaxConcurrency,
 		RequestTimeout:          DefaultRequestTimeout,
@@ -128,19 +135,7 @@ func LoadFrom(env func(string) string) (Config, error) {
 		cfg.Addr = v
 	}
 
-	name := DefaultProvider
-	if v := get(EnvProvider); v != "" {
-		name = v
-	}
-	preset, ok := Lookup(name)
-	if !ok {
-		return Config{}, fmt.Errorf("%s: unknown provider %q; known providers are %s", EnvProvider, name, providerNames())
-	}
-	cfg.Provider = preset.Name
-	cfg.BaseURL = preset.BaseURL
-	cfg.Model = preset.DefaultModel
-
-	if v := get(EnvBaseURL); v != "" {
+	if v := get(EnvInferenceBaseURL); v != "" {
 		cfg.BaseURL = v
 	}
 	// A base URL that cannot be called makes every request fail with a 500
@@ -148,16 +143,17 @@ func LoadFrom(env func(string) string) (Config, error) {
 	// other malformed setting. The message names the variable and not the
 	// value: a base URL may carry a credential.
 	if err := ValidateBaseURL(cfg.BaseURL); err != nil {
-		return Config{}, fmt.Errorf("%s %w", EnvBaseURL, err)
+		return Config{}, fmt.Errorf("%s %w", EnvInferenceBaseURL, err)
 	}
 	if v := get(EnvModel); v != "" {
 		cfg.Model = v
 	}
 
+	// PERCEPTEA_API_KEY is the only variable a key is read from. Nothing here
+	// consults a vendor-specific one: a key picked up from a variable the
+	// operator did not point at this service is a credential spent by
+	// accident.
 	cfg.APIKey = get(EnvAPIKey)
-	if cfg.APIKey == "" {
-		cfg.APIKey = get(preset.EnvKey)
-	}
 
 	if v := get(EnvTemperature); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
@@ -206,16 +202,6 @@ func LoadFrom(env func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s: %q is not a boolean such as %q or %q", EnvAllowRequestCredentials, v, "true", "false")
 		}
 		cfg.AllowRequestCredentials = b
-	}
-
-	if v := get(EnvAllowedBaseURLs); v != "" {
-		prefixes := parseAllowedBaseURLs(v)
-		for i, prefix := range prefixes {
-			if err := ValidateBaseURL(prefix); err != nil {
-				return Config{}, fmt.Errorf("%s: entry %d %w", EnvAllowedBaseURLs, i+1, err)
-			}
-		}
-		cfg.AllowedBaseURLs = prefixes
 	}
 
 	if v := get(EnvLogLevel); v != "" {

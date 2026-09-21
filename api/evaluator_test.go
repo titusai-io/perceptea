@@ -40,7 +40,7 @@ func TestDefaultEvaluatorFactory(t *testing.T) {
 	ev, err := f.newEvaluator(Settings{
 		APIKey:         testKey,
 		BaseURL:        "https://api.openai.com/v1",
-		Model:          "gpt-4o-mini",
+		Model:          "probe-1",
 		MaxConcurrency: 4,
 	})
 	if err != nil {
@@ -60,7 +60,7 @@ func TestDefaultEvaluatorFactory(t *testing.T) {
 	if got.BaseURL != "https://api.openai.com/v1" {
 		t.Errorf("Config.BaseURL = %q", got.BaseURL)
 	}
-	if got.Model != "gpt-4o-mini" {
+	if got.Model != "probe-1" {
 		t.Errorf("Config.Model = %q", got.Model)
 	}
 	// One evaluation is many calls, so the retry count multiplies: it is a
@@ -121,7 +121,7 @@ func TestDefaultEvaluatorFactorySharesOneHTTPClient(t *testing.T) {
 // choice with 8 options cost 23 upstream calls instead of 8.
 func TestTheProviderClientIsReusedAcrossRequests(t *testing.T) {
 	f, built := countingFactory(t)
-	base := Settings{APIKey: testKey, BaseURL: "https://api.openai.com/v1", Model: "gpt-4o-mini", MaxConcurrency: 8}
+	base := Settings{APIKey: testKey, BaseURL: "https://api.openai.com/v1", Model: "probe-1", MaxConcurrency: 8}
 
 	for range 3 {
 		if _, err := f.newEvaluator(base); err != nil {
@@ -147,7 +147,7 @@ func TestTheProviderClientIsReusedAcrossRequests(t *testing.T) {
 	for _, tweak := range []func(*Settings){
 		func(s *Settings) { s.APIKey = "sk-someone-else-0123456789" },
 		func(s *Settings) { s.BaseURL = "https://openrouter.ai/api/v1" },
-		func(s *Settings) { s.Model = "gpt-4o" },
+		func(s *Settings) { s.Model = "probe-2" },
 	} {
 		st := base
 		tweak(&st)
