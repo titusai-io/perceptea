@@ -1,0 +1,241 @@
+package config
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// The environment variables Perceptea reads. Every one of them is optional.
+const (
+	EnvAddr                    = "PERCEPTEA_ADDR"
+	EnvProvider                = "PERCEPTEA_PROVIDER"
+	EnvBaseURL                 = "PERCEPTEA_BASE_URL"
+	EnvAPIKey                  = "PERCEPTEA_API_KEY"
+	EnvModel                   = "PERCEPTEA_MODEL"
+	EnvTemperature             = "PERCEPTEA_TEMPERATURE"
+	EnvMaxConcurrency          = "PERCEPTEA_MAX_CONCURRENCY"
+	EnvRequestTimeout          = "PERCEPTEA_REQUEST_TIMEOUT"
+	EnvMaxBodyBytes            = "PERCEPTEA_MAX_BODY_BYTES"
+	EnvAllowRequestCredentials = "PERCEPTEA_ALLOW_REQUEST_CREDENTIALS"
+	EnvAllowedBaseURLs         = "PERCEPTEA_ALLOWED_BASE_URLS"
+	EnvLogLevel                = "PERCEPTEA_LOG_LEVEL"
+	EnvLogFormat               = "PERCEPTEA_LOG_FORMAT"
+)
+
+// Defaults applied when a variable is unset or empty.
+const (
+	DefaultAddr = ":8080"
+	// DefaultProvider is the preset used when PERCEPTEA_PROVIDER is unset.
+	DefaultProvider = "openai"
+	// DefaultTemperature is 0 because it is the only setting that makes a
+	// classification reproducible.
+	DefaultTemperature = 0.0
+	// DefaultMaxConcurrency bounds the micro-calls one evaluation may have in
+	// flight at once.
+	DefaultMaxConcurrency = 8
+	// DefaultRequestTimeout bounds one whole /api/evaluate request.
+	DefaultRequestTimeout = 60 * time.Second
+	// DefaultMaxBodyBytes is 2 MiB: far more than a state and a question set
+	// plausibly need, and still small enough that a body this size cannot be
+	// used to tie the server up.
+	DefaultMaxBodyBytes = int64(2 * 1024 * 1024)
+	// DefaultAllowRequestCredentials lets a request carry its own key, which
+	// is what makes the service usable straight out of the box. Turn it off
+	// outside development.
+	DefaultAllowRequestCredentials = true
+	// DefaultLogLevel is info.
+	DefaultLogLevel = slog.LevelInfo
+	// DefaultLogFormat is human-readable text.
+	DefaultLogFormat = LogFormatText
+)
+
+// Log formats understood by PERCEPTEA_LOG_FORMAT.
+const (
+	LogFormatText = "text"
+	LogFormatJSON = "json"
+)
+
+// Config is the resolved server configuration.
+type Config struct {
+	// Addr is the listen address, as accepted by net.Listen.
+	Addr string
+	// Provider is the name of the resolved preset.
+	Provider string
+	// BaseURL is the OpenAI-compatible API root actually used.
+	BaseURL string
+	// APIKey is the server's own key. It may be empty: the server still
+	// starts, and requests that cannot supply a key are rejected with 401.
+	APIKey string
+	// Model is the default model for requests that do not name one.
+	Model string
+	// Temperature is the default sampling temperature.
+	Temperature float64
+	// MaxConcurrency bounds in-flight scoring calls per evaluation.
+	MaxConcurrency int
+	// RequestTimeout bounds one HTTP request end to end.
+	RequestTimeout time.Duration
+	// MaxBodyBytes bounds a request body.
+	MaxBodyBytes int64
+	// AllowRequestCredentials lets a request body override api_key and
+	// base_url. Exposing the service with this on makes it an open proxy.
+	AllowRequestCredentials bool
+	// AllowedBaseURLs bounds that open proxy: a base URL supplied in a
+	// request body must start with one of these prefixes. It is empty by
+	// default, which allows any of them. It never applies to the server's own
+	// BaseURL, which the operator chose.
+	AllowedBaseURLs []string
+	// LogLevel is the minimum level logged.
+	LogLevel slog.Level
+	// LogFormat is either LogFormatText or LogFormatJSON.
+	LogFormat string
+}
+
+// APIKeyConfigured reports whether the server holds a key of its own. It never
+// exposes the key itself.
+func (c Config) APIKeyConfigured() bool { return c.APIKey != "" }
+
+// Load reads the configuration from the process environment.
+func Load() (Config, error) { return LoadFrom(os.Getenv) }
+
+// LoadFrom reads the configuration through env, which behaves like
+// [os.Getenv]: it returns the empty string for a variable that is not set. It
+// exists so that configuration can be tested without touching the process.
+//
+// A missing API key is not an error: the server is allowed to start without
+// one and reject the requests that need it.
+func LoadFrom(env func(string) string) (Config, error) {
+	if env == nil {
+		env = func(string) string { return "" }
+	}
+	get := func(key string) string { return strings.TrimSpace(env(key)) }
+
+	cfg := Config{
+		Addr:                    DefaultAddr,
+		Temperature:             DefaultTemperature,
+		MaxConcurrency:          DefaultMaxConcurrency,
+		RequestTimeout:          DefaultRequestTimeout,
+		MaxBodyBytes:            DefaultMaxBodyBytes,
+		AllowRequestCredentials: DefaultAllowRequestCredentials,
+		LogLevel:                DefaultLogLevel,
+		LogFormat:               DefaultLogFormat,
+	}
+
+	if v := get(EnvAddr); v != "" {
+		cfg.Addr = v
+	}
+
+	name := DefaultProvider
+	if v := get(EnvProvider); v != "" {
+		name = v
+	}
+	preset, ok := Lookup(name)
+	if !ok {
+		return Config{}, fmt.Errorf("%s: unknown provider %q; known providers are %s", EnvProvider, name, providerNames())
+	}
+	cfg.Provider = preset.Name
+	cfg.BaseURL = preset.BaseURL
+	cfg.Model = preset.DefaultModel
+
+	if v := get(EnvBaseURL); v != "" {
+		cfg.BaseURL = v
+	}
+	// A base URL that cannot be called makes every request fail with a 500
+	// while /api/health still reports ok, so it is a startup error like any
+	// other malformed setting. The message names the variable and not the
+	// value: a base URL may carry a credential.
+	if err := ValidateBaseURL(cfg.BaseURL); err != nil {
+		return Config{}, fmt.Errorf("%s %w", EnvBaseURL, err)
+	}
+	if v := get(EnvModel); v != "" {
+		cfg.Model = v
+	}
+
+	cfg.APIKey = get(EnvAPIKey)
+	if cfg.APIKey == "" {
+		cfg.APIKey = get(preset.EnvKey)
+	}
+
+	if v := get(EnvTemperature); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %q is not a number", EnvTemperature, v)
+		}
+		cfg.Temperature = f
+	}
+
+	if v := get(EnvMaxConcurrency); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %q is not a whole number", EnvMaxConcurrency, v)
+		}
+		if n < 1 {
+			return Config{}, fmt.Errorf("%s: must be at least 1, got %d", EnvMaxConcurrency, n)
+		}
+		cfg.MaxConcurrency = n
+	}
+
+	if v := get(EnvRequestTimeout); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %q is not a duration such as %q", EnvRequestTimeout, v, "60s")
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("%s: must be positive, got %s", EnvRequestTimeout, d)
+		}
+		cfg.RequestTimeout = d
+	}
+
+	if v := get(EnvMaxBodyBytes); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %q is not a whole number of bytes", EnvMaxBodyBytes, v)
+		}
+		if n < 1 {
+			return Config{}, fmt.Errorf("%s: must be at least 1, got %d", EnvMaxBodyBytes, n)
+		}
+		cfg.MaxBodyBytes = n
+	}
+
+	if v := get(EnvAllowRequestCredentials); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %q is not a boolean such as %q or %q", EnvAllowRequestCredentials, v, "true", "false")
+		}
+		cfg.AllowRequestCredentials = b
+	}
+
+	if v := get(EnvAllowedBaseURLs); v != "" {
+		prefixes := parseAllowedBaseURLs(v)
+		for i, prefix := range prefixes {
+			if err := ValidateBaseURL(prefix); err != nil {
+				return Config{}, fmt.Errorf("%s: entry %d %w", EnvAllowedBaseURLs, i+1, err)
+			}
+		}
+		cfg.AllowedBaseURLs = prefixes
+	}
+
+	if v := get(EnvLogLevel); v != "" {
+		var lvl slog.Level
+		if err := lvl.UnmarshalText([]byte(v)); err != nil {
+			return Config{}, fmt.Errorf("%s: %q is not a level such as %q, %q, %q or %q", EnvLogLevel, v, "debug", "info", "warn", "error")
+		}
+		cfg.LogLevel = lvl
+	}
+
+	if v := get(EnvLogFormat); v != "" {
+		switch strings.ToLower(v) {
+		case LogFormatText:
+			cfg.LogFormat = LogFormatText
+		case LogFormatJSON:
+			cfg.LogFormat = LogFormatJSON
+		default:
+			return Config{}, fmt.Errorf("%s: %q is not a format; expected %q or %q", EnvLogFormat, v, LogFormatText, LogFormatJSON)
+		}
+	}
+
+	return cfg, nil
+}
