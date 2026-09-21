@@ -11,6 +11,18 @@ always called out below.
 
 ### Added
 
+- **Limitations now carry the comparison against a single structured-output
+  call.** Measured on a held-out set of 764 questions against one call asking
+  the same model for a full distribution over the same candidates: no
+  accuracy advantage is demonstrated (0.712 against 0.688, McNemar p = 0.21
+  pooled, and `choice` level at p = 0.92), while the probabilities themselves
+  are better (Brier 0.417 against 0.493, a difference of 0.063 with a 95%
+  confidence interval of [0.011, 0.115]). The token premium is recorded per
+  question type rather than as one number, because it is the candidate count:
+  a `noul` is cheaper than the single call, a `score` of three levels costs
+  3.2× and a `choice` of four 3.8×. Also recorded: a model fine-tuned on your
+  task distribution will beat this on accuracy, and no prompt work closes
+  that gap.
 - **`PERCEPTEA_SOFTMAX_TEMPERATURE`, the divisor a question's candidate
   logits are softmaxed at.** It is not `PERCEPTEA_TEMPERATURE`, which is the
   sampling temperature the provider is sent; this one is never sent anywhere

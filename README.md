@@ -1165,6 +1165,30 @@ nobody else, carries no such obligation.
   with three questions and nine candidates is nine model calls. Ten questions
   of ten options each is a hundred. `PERCEPTEA_MAX_CONCURRENCY` bounds how
   many run at once, not how many run.
+- **Against a single structured-output call, the premium is per-candidate,
+  not general.** Measured on a held-out set of 764 questions, against one call
+  asking the same model for a full distribution over the same candidates: a
+  `noul` is one call either way and came in at 143 tokens against 198, because
+  this prompt carries no schema to explain. A `score` of three levels cost
+  3.2× as many tokens, and a `choice` averaging 4.2 options cost 3.8×. The
+  ratio is the candidate count, so it is knowable in advance from the question
+  and not a property of the workload. Where an endpoint caches a matching
+  prompt prefix most of that disappears, because the repeats are nearly all
+  prefix; where it does not, the multiple is paid in full.
+- **No accuracy advantage over that single call has been demonstrated.** On
+  the same 764 questions the difference was 0.712 against 0.688, which a
+  paired test does not support: McNemar gives p = 0.21 pooled, and `choice`
+  questions alone are level at p = 0.92. What the same run does support is the
+  probabilities rather than the picks — a Brier score of 0.417 against 0.493,
+  a difference of 0.063 with a 95% confidence interval of [0.011, 0.115]. The
+  reason to reach for this is a number you can threshold, not a better answer.
+  Both figures are one model on one labelled set; `perceptea-bench` is how you
+  find out what they are on yours.
+- **A model fine-tuned on your task distribution will beat it on accuracy.**
+  That gap is learned task knowledge and no amount of prompt work closes it.
+  What such a model cannot do is answer a question it was never trained on,
+  and every question here is declared in the request. That is the trade, and
+  it is the whole trade.
 - **`PERCEPTEA_ALLOW_REQUEST_CREDENTIALS` turns the service into an open
   proxy.** With it on, any caller can supply `inference_base_url` and
   `api_key` and have the service make the call for them — to any host it can
