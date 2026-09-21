@@ -62,7 +62,7 @@ go run ./cmd/perceptea
 ```
 time=2026-09-20T21:12:58.122-04:00 level=INFO msg="perceptea listening" addr=[::]:8080
   inference_base_url=https://api.deepinfra.com/v1/openai
-  model=Qwen/Qwen3.8-Flash
+  model=mistralai/Mistral-Small-24B-Instruct-2501
   api_key_configured=true allow_request_credentials=true request_timeout=1m0s
   max_concurrency=8
 ```
@@ -106,7 +106,7 @@ comes up and rejects the requests that would need one with a 401.
 | `PERCEPTEA_ADDR` | `:8080` | Listen address. `-addr` overrides it. |
 | `PERCEPTEA_INFERENCE_BASE_URL` | `https://api.deepinfra.com/v1/openai` | The API root of the service that runs the model — see below. Must be an absolute `http` or `https` URL. A credential in it — userinfo, or a `?key=` — never reaches a response or a log line. |
 | `PERCEPTEA_API_KEY` | — | The key sent to that endpoint as a bearer token. The only variable a key is read from. |
-| `PERCEPTEA_MODEL` | `Qwen/Qwen3.8-Flash` | The model id to score with. It has to be one the endpoint above serves, and it should be one that does not reason — see [Choosing a model](#choosing-a-model). |
+| `PERCEPTEA_MODEL` | `mistralai/Mistral-Small-24B-Instruct-2501` | The model id to score with. It has to be one the endpoint above serves, and it should be one that does not reason — see [Choosing a model](#choosing-a-model). |
 | `PERCEPTEA_REASONING_EFFORT` | — | Sent to the provider as `reasoning_effort`: `none`, `low`, `medium` or `high`. Unset sends no reasoning field at all. See [Choosing a model](#choosing-a-model). |
 | `PERCEPTEA_TEMPERATURE` | `0` | Sampling temperature. 0 is the only reproducible setting. |
 | `PERCEPTEA_MAX_CONCURRENCY` | `8` | Scoring calls in flight per evaluation. |
@@ -145,7 +145,7 @@ else that speaks the same chat completions API.
 
 | Where the model runs | `PERCEPTEA_INFERENCE_BASE_URL` | An id for `PERCEPTEA_MODEL` |
 |---|---|---|
-| DeepInfra | `https://api.deepinfra.com/v1/openai` | `Qwen/Qwen3.8-Flash` |
+| DeepInfra | `https://api.deepinfra.com/v1/openai` | `mistralai/Mistral-Small-24B-Instruct-2501` |
 | OpenRouter | `https://openrouter.ai/api/v1` | `meta-llama/llama-3.1-8b-instruct` |
 | Z.ai | `https://api.z.ai/api/paas/v4` | `glm-5.3-flash` (a reasoning model — read the next section first) |
 | Ollama, locally | `http://localhost:11434/v1` | whatever you have pulled, e.g. `llama3.1` |
@@ -265,9 +265,9 @@ Remember the shape of the bill: the input column is the one you are paying.
 
 | Model | In $/M | Out $/M | Notes |
 |---|---|---|---|
-| **`Qwen/Qwen3.8-Flash`** | **0.113** | **0.382** | **The default.** Non-reasoning, structured output. Current-generation and needs no switch thrown. |
+| **`mistralai/Mistral-Small-24B-Instruct-2501`** | **0.050** | **0.080** | **The default.** Non-reasoning, structured output, built for low latency. |
 | `mistralai/Mistral-Nemo-Instruct-2407` | 0.019 | 0.030 | Non-reasoning, structured output, tools. The cheapest of the set; a small model, so a fine swap when the questions are easy. |
-| `mistralai/Mistral-Small-24B-Instruct-2501` | 0.050 | 0.080 | Non-reasoning, structured output, built for low latency. |
+| `Qwen/Qwen3.8-Flash` | 0.113 | 0.382 | Non-reasoning, structured output. Its endpoint rejects a strict `json_schema`, so it runs a level down — see the note below the table. |
 | `Qwen/Qwen3-32B` | 0.080 | 0.280 | Non-reasoning, structured output. The cheapest current Qwen. |
 | `google/gemma-3-27b-it` | 0.080 | 0.160 | Non-reasoning, structured output, tools. |
 | `deepseek-ai/DeepSeek-V4-Flash` | 0.090 | 0.180 | `can-disable-reasoning` — set the effort to `none`, and see the caveat below. |
@@ -307,9 +307,9 @@ Take a 300-token state and the 9-candidate request above. Each call carries
 the system prompt, the state and one statement — call it 300 tokens — so the
 request is roughly **2,700 input tokens and 90 output tokens**.
 
-At the default model's prices that is 2,700 × $0.113/M + 90 × $0.382/M ≈
-**$0.00034**, about a third of a tenth of a cent. A thousand requests is
-thirty-four cents. Even the most expensive row above stays under a tenth of a
+At the default model's prices that is 2,700 × $0.050/M + 90 × $0.080/M ≈
+**$0.00014**, about a seventh of a tenth of a cent. A thousand requests is
+fourteen cents. Even the most expensive row above stays under a tenth of a
 cent per request.
 
 So cost is rarely the thing to optimise. **Reliability is**: a model that
@@ -380,13 +380,13 @@ curl -s localhost:8080/api/evaluate \
         "instructions": "Strong frustration or anger?"
       }
     },
-    "model": "Qwen/Qwen3.8-Flash"
+    "model": "mistralai/Mistral-Small-24B-Instruct-2501"
   }' | jq
 ```
 
 ```json
 {
-  "model": "Qwen/Qwen3.8-Flash",
+  "model": "mistralai/Mistral-Small-24B-Instruct-2501",
   "answers": {
     "department": {
       "type": "choice",
@@ -443,7 +443,7 @@ curl -s localhost:8080/api/health
 ```
 
 ```json
-{"ok":true,"service":"perceptea","inference_base_url":"https://api.deepinfra.com/v1/openai","model":"Qwen/Qwen3.8-Flash","api_key_configured":true}
+{"ok":true,"service":"perceptea","inference_base_url":"https://api.deepinfra.com/v1/openai","model":"mistralai/Mistral-Small-24B-Instruct-2501","api_key_configured":true}
 ```
 
 It reports what this process would call: the endpoint, the model, and whether
@@ -544,7 +544,7 @@ func main() {
 	client, err := inference.New(inference.Config{
 		APIKey:  os.Getenv("PERCEPTEA_API_KEY"),
 		BaseURL: "https://api.deepinfra.com/v1/openai",
-		Model:   "Qwen/Qwen3.8-Flash",
+		Model:   "mistralai/Mistral-Small-24B-Instruct-2501",
 	})
 	if err != nil {
 		panic(err)
@@ -568,7 +568,7 @@ func main() {
 		Evaluate(context.Background(), classifier.Request{
 			State:     classifier.StringState("Charged twice again!! Second month in a row."),
 			Questions: *questions,
-			Model:     "Qwen/Qwen3.8-Flash",
+			Model:     "mistralai/Mistral-Small-24B-Instruct-2501",
 		})
 	if err != nil {
 		panic(err)
