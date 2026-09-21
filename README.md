@@ -461,15 +461,6 @@ switch. And a reasoning model is worse here than for the chat scorer: its one
 token is a thinking token, so pair `logprob` with
 `PERCEPTEA_REASONING_EFFORT=none` or a model that does not reason.
 
-### One honest caveat
-
-None of these models is calibrated for this task. A reply of `0.87` means the
-model was willing to write 0.87; it is not a frequency, and nothing here has
-been fitted to outcomes. **Compare the probabilities across the candidates of
-one question, not across states or across models.** A distribution of
-`0.71 / 0.12 / 0.17` says the first option was preferred by roughly that much
-on this state, and that is all it says.
-
 ## API
 
 ### `POST /api/evaluate`
@@ -1012,12 +1003,12 @@ nobody else, carries no such obligation.
 
 ## Limitations
 
-- **The probabilities are normalised opinions, not calibrated ones.** A
-  distribution that reads `0.71 / 0.12 / 0.17` says the model preferred the
-  first option by roughly that much on this state. It is not a frequency, and
-  nothing here has been fitted to outcomes. Compare them across candidates,
-  not across states, and do not feed them into anything that assumes a
-  calibrated prior.
+- **Nothing here is fitted to outcomes, so measure before you trust a
+  threshold.** The probabilities come from the model you point at, normalised
+  across a question's candidates. Whether they are well calibrated is a
+  property of that model on your data, and it is a question with an answer:
+  `perceptea-bench` reports the Brier score and the calibration error on a
+  labelled set of your own. Run it before you pick the number you branch on.
 - **Cost and latency scale with the number of declared candidates.** A request
   with three questions and nine candidates is nine model calls. Ten questions
   of ten options each is a hundred. `PERCEPTEA_MAX_CONCURRENCY` bounds how
